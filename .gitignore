@@ -1,0 +1,62 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+.Python
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editors / IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Claude Code / AI tooling ──
+.claude/
+.cursor/
+
+# ── Secrets & local config ──
+.env
+*.env.local
+.env.*.local
+
+# ── Models (users fetch via README instructions) ──
+*.onnx
+*.task
+*.bin
+*.pt
+*.gguf
+*.safetensors
+models/
+
+# ── Runtime artifacts ──
+logs/
+*.log
+tts_cache/
+conversation_log.jsonl
+*.jsonl
+!example_*.jsonl
+
+# ── Temporary ──
+tmp/
+*.tmp
+*.pid
+*.sock
+
+# ── User-specific dev notes ──
+HANDOVER.md
+SCRATCH.md
+archive/
