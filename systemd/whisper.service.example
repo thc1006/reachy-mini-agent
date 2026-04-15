@@ -1,0 +1,15 @@
+[Unit]
+Description=Whisper STT server (faster-whisper, port 8881)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/reachy-mini-agent
+ExecStart=%h/reachy-mini-agent/.venv/bin/python src/whisper_server.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/reachy-mini-agent/logs/whisper.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

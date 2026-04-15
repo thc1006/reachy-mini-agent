@@ -1,0 +1,15 @@
+[Unit]
+Description=Kokoro TTS server (OpenAI-compatible /v1/audio/speech, port 8880)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/reachy-mini-agent
+ExecStart=%h/reachy-mini-agent/.venv/bin/python src/kokoro_server.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/reachy-mini-agent/logs/kokoro.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
