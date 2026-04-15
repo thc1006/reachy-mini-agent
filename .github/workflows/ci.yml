@@ -22,16 +22,18 @@ jobs:
       - name: Install tooling
         run: |
           python -m pip install --upgrade pip
-          pip install ruff
+          pip install ruff pytest
 
-      - name: ruff (non-blocking)
-        continue-on-error: true
-        run: ruff check --output-format=github src/ tests/ 2>/dev/null || ruff check --output-format=github src/
+      - name: ruff
+        run: ruff check --output-format=github src/ tests/
 
       - name: Python syntax check
         run: |
           python -m compileall -q src/
-          python -m compileall -q tests/ 2>/dev/null || true
+          python -m compileall -q tests/
+
+      - name: pytest (smoke tests, no hardware)
+        run: pytest tests/ -v
 
   package-build:
     name: Package builds
