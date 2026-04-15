@@ -1,5 +1,11 @@
 # reachy-mini-agent
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![CI](https://github.com/thc1006/reachy-mini-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/thc1006/reachy-mini-agent/actions/workflows/ci.yml)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Code of Conduct](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
+
 **Real-time voice + vision AI agent for the [Reachy Mini](https://github.com/pollen-robotics/reachy-mini) robot.**
 Runs fully on your own GPU: local LLM (Ollama / Qwen3), Whisper STT, Kokoro or Microsoft Edge TTS, MediaPipe hand gestures, YuNet face tracking, WebRTC for audio/video — optionally bridged over Tailscale so the brain can live on a beefy server while the robot stays in the living room.
 
@@ -123,10 +129,12 @@ Pollen's official [`reachy_mini_conversation_app`](https://huggingface.co/spaces
 
 ## Roadmap / known issues
 
-- [ ] USB audio pipeline from daemon to speaker occasionally silent after long uptime — see issue #1
+- [ ] USB audio pipeline from daemon to speaker occasionally silent after long uptime (workaround: `sudo systemctl restart reachy-mini-daemon`)
 - [ ] Voice cloning of Ana via XTTS-v2 to bring the cute Microsoft voice fully offline
 - [ ] Multi-peer WebRTC (daemon currently gives the media stream to one client at a time)
 - [ ] Windows / macOS brain-host support (currently Linux only due to GStreamer plugin paths)
+
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

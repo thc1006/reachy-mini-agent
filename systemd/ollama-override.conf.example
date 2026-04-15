@@ -1,0 +1,16 @@
+# Drop-in override for the system-level Ollama service.
+#
+# Installation:
+#   sudo mkdir -p /etc/systemd/system/ollama.service.d
+#   sudo cp systemd/ollama-override.conf.example \
+#     /etc/systemd/system/ollama.service.d/override.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart ollama
+#
+# Purpose: keep the chat model (qwen3:8b) and the vision model (qwen2.5vl:7b)
+# resident simultaneously so we don't pay the 1–2 s model-load cost on every
+# vision tick. Default Ollama evicts models after 5 min of idle and only holds
+# one model in memory at a time.
+[Service]
+Environment=OLLAMA_MAX_LOADED_MODELS=2
+Environment=OLLAMA_KEEP_ALIVE=30m
+Environment=OLLAMA_NUM_PARALLEL=1
