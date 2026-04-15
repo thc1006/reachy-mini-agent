@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/thc1006/reachy-mini-agent/security/advisories/new
+    about: Please report security issues privately via GitHub advisories, not as public issues.
+  - name: Reachy Mini hardware / firmware questions
+    url: https://github.com/pollen-robotics/reachy-mini
+    about: This repo only covers the conversational agent layer. Hardware/firmware bugs belong upstream.

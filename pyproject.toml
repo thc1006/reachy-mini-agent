@@ -60,3 +60,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"
+
+[tool.ruff.lint]
+# Conservative rule set: only catch actual bugs, not style.
+# Style is enforced by human review per CONTRIBUTING.md.
+select = ["F"]
+ignore = [
+    "F401",  # unused imports (edge-tts etc. have side-effect imports)
+    "F541",  # f-string without placeholders
+    "F841",  # unused local variable
+]

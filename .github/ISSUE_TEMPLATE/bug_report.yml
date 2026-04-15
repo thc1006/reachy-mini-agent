@@ -1,0 +1,52 @@
+name: Bug report
+description: Something is broken or not behaving as documented.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior vs. what you expected.
+      placeholder: |
+        I ran `scripts/run_robot.sh` and the robot... instead of...
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, specific steps. Include the exact commands.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste the last ~50 lines from `logs/robot_brain.log` (or `journalctl --user -u robot-brain`). Redact anything you don't want public.
+      render: shell
+
+  - type: input
+    id: hw
+    attributes:
+      label: Hardware
+      description: Brain host (CPU/GPU/RAM), Reachy Mini firmware, OS version.
+      placeholder: "2× RTX 3090, Ubuntu 24.04, Reachy Mini firmware 1.6.3"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Relevant .env settings
+      description: Don't include secrets. Just the flags that feel relevant (LLM_MODE, TTS_ENGINE, models, etc.)
+      render: dotenv
