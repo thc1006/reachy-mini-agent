@@ -60,3 +60,25 @@ tmp/
 HANDOVER.md
 SCRATCH.md
 archive/
+
+# ── Session scratch (file exchange with remote deploy host, NOT source) ──
+_s1_edit/
+_publish/
+_publish.tar.gz
+_pr_body.md
+bash.exe.stackdump
+
+# ── Separate public bench repo artefacts (see qwen3.6-specdec-rtx3090 repo) ──
+bench/
+bench_llm.py
+bench_qwen36.py
+bench_tts.py
+
+# ── Runtime state written by robot-brain on the deploy host ──
+conversation_summary.txt
+conversation_summary.txt.watermark
+.qdrant_memory/
+
+# ── pytest + lint caches ──
+.pytest_cache/
+.ruff_cache/
