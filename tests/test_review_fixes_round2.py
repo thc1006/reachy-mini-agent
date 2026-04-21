@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-PY   = str(ROOT / ".venv" / "bin" / "python")
+from tests._helpers import PY, ROOT, ollama_running
+# No module-level skipif: pure-logic classes (TestCountParserQueryAware) must
+# still run on CI without Ollama; subprocess-based classes below are skipped
+# individually.
 
 def _run(script, env_extra=None, timeout=120):
     env = os.environ.copy(); env["PYTHONPATH"] = str(ROOT)
@@ -50,6 +52,7 @@ class TestCountParserQueryAware:
 
 # ── M6: memory search TTL cache ──────────────────────────────────────────
 
+@pytest.mark.skipif(not ollama_running(), reason="subprocess imports robot_brain (requires Ollama)")
 class TestMemorySearchCache:
     """All 3 scenarios in one subprocess — robot_brain import is heavy (CUDA +
     Mediapipe) and triggers rare init races when repeated across many subprocs."""
@@ -97,6 +100,7 @@ print(f'S3_CACHE_SIZE={len(rb._MEM_SEARCH_CACHE)}')
 
 # ── M7: VISION_OLLAMA_URL / VISION_MODEL runtime env ─────────────────────
 
+@pytest.mark.skipif(not ollama_running(), reason="subprocess imports robot_tools (needs reachy_mini SDK)")
 class TestVisionEndpointRuntime:
     def test_env_change_after_import_wins(self):
         """_vision_endpoint reads env at call time, not import time."""
@@ -131,6 +135,7 @@ print(f'MODEL={model}')
 
 # ── C4: flush_summary real timeout ───────────────────────────────────────
 
+@pytest.mark.skipif(not ollama_running(), reason="subprocess imports robot_memory (Mem0 requires Ollama)")
 class TestFlushSummaryTimeout:
     def test_returns_true_when_nothing_pending(self):
         script = """

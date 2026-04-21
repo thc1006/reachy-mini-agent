@@ -16,6 +16,12 @@ import json
 import time
 import urllib.request
 import pytest
+from tests._helpers import ollama_running, pillow_available
+
+pytestmark = [
+    pytest.mark.skipif(not ollama_running(), reason="Ollama not reachable"),
+    pytest.mark.skipif(not pillow_available(), reason="Pillow not installed — install .[dev]"),
+]
 
 OLLAMA = "http://localhost:11434"
 

@@ -9,8 +9,12 @@ import sys
 import os
 import pytest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PY   = os.path.join(ROOT, ".venv", "bin", "python")
+from tests._helpers import PY, ROOT, ollama_running
+
+pytestmark = pytest.mark.skipif(
+    not ollama_running(),
+    reason="Ollama not reachable — skipping TTS engine e2e tests (pull reachy_mini + mediapipe)",
+)
 
 
 def _run_subprocess(script: str, env_extra: dict | None = None, timeout=90):

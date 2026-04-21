@@ -17,8 +17,7 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-PY   = str(ROOT / ".venv" / "bin" / "python")
+from tests._helpers import PY, ROOT, ollama_running, pillow_available
 
 
 def _make_scene_jpeg_b64() -> str:
@@ -65,6 +64,7 @@ class TestVisionToolRegistry:
 
 # --- No-frame path: graceful error, no crash ---------------------------------
 
+@pytest.mark.skipif(not ollama_running(), reason="subprocess runs import robot_brain which needs Ollama")
 class TestNoFrame:
     def test_see_what_returns_error_when_no_frame(self):
         r = _run(
@@ -88,6 +88,8 @@ class TestNoFrame:
 
 # --- End-to-end with qwen3.6 vision + test JPEG (integration) ---------------
 
+@pytest.mark.skipif(not ollama_running(), reason="requires Ollama qwen3.6 VL endpoint")
+@pytest.mark.skipif(not pillow_available(), reason="Pillow not installed — install .[dev] to run VL e2e tests")
 class TestVisionE2E:
     """These hit the Ollama qwen3.6:35b-a3b VL endpoint for real. Cold load ~7s
     first time, then <1s per call."""

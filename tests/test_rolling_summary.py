@@ -18,8 +18,12 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-PY   = str(ROOT / ".venv" / "bin" / "python")
+from tests._helpers import PY, ROOT, ollama_running
+
+pytestmark = pytest.mark.skipif(
+    not ollama_running(),
+    reason="Ollama not reachable — skipping rolling-summary e2e tests",
+)
 
 
 def _run(script: str, env_extra=None, timeout=240):

@@ -20,6 +20,12 @@ import subprocess
 import time
 import urllib.request
 import pytest
+from tests._helpers import ollama_running
+
+pytestmark = pytest.mark.skipif(
+    not ollama_running(),
+    reason="Ollama not reachable — spec-decode probe tests require a live endpoint",
+)
 
 OLLAMA = "http://localhost:11434"
 TARGET = "qwen3.6:35b-a3b"
