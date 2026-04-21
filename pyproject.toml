@@ -47,6 +47,13 @@ dependencies = [
 [project.optional-dependencies]
 kokoro = ["kokoro-onnx>=0.4.0", "fastapi>=0.115", "uvicorn>=0.32", "onnxruntime-gpu>=1.20"]
 servers = ["fastapi>=0.115", "uvicorn>=0.32", "pydantic>=2.5"]
+# Long-term memory: Mem0 does LLM-assisted fact extraction, Qdrant embedded
+# stores vectors on disk (no server), Ollama client is used to reach local
+# bge-m3 for embeddings + qwen3.6 for the extraction LLM call.
+memory = ["mem0ai>=2.0", "qdrant-client>=1.17", "ollama>=0.6"]
+# Hugging Face CLI is used by the bench / dev scripts that download GGUF
+# weights; not required at runtime.
+dev    = ["huggingface-hub[cli]>=1.3", "pytest>=8.0", "pandas>=2.0", "matplotlib>=3.10"]
 
 [project.urls]
 Homepage      = "https://github.com/thc1006/reachy-mini-agent"
