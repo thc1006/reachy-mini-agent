@@ -120,10 +120,41 @@ class SpeechStreamExtractor:
     # Whitespace tolerance: "speech":" and "speech" : " and "speech"\n:\n" all hit.
     _MARKER_RE = re.compile(r'"\s*speech\s*"\s*:\s*"')
 
+    # If after this many chars no JSON marker appears, fall back to plain-text.
+    # qwen3.6 with enable_thinking=False tends to drop the JSON wrapper and just
+    # speak directly, e.g. "Think! 🤖 Hello! ...\n\nactions: [...]". We pass
+    # such text through (after the strippers below) instead of staying silent.
+    _PLAIN_FALLBACK_THRESHOLD = 60
+
+    # Strip preambles the model sometimes emits in non-thinking mode.
+    _PREAMBLE_RE = re.compile(r"^(?:Think|Nod|Wave|Happy|Sad)!\s*[\U0001F300-\U0001FAFF]*\s*", re.UNICODE)
+    # Strip trailing `actions: [...]` text-form (not real JSON).
+    _ACTIONS_TAIL_RE = re.compile(r"\s*\n*\s*actions\s*:\s*\[.*?\]\s*$", re.DOTALL | re.IGNORECASE)
+
     def __init__(self) -> None:
         self._buf: str = ""
-        self._state: str = "hunting"   # hunting → in_speech → done
+        self._state: str = "hunting"   # hunting → in_speech → done; or → plain
         self._pos: int = 0             # index in _buf we've processed up to
+        self._plain_emitted: int = 0   # chars emitted in plain mode
+
+    def _enter_plain_if_needed(self) -> None:
+        """Switch to plain mode if we've buffered enough chars with no JSON marker."""
+        if self._state != "hunting":
+            return
+        if len(self._buf) < self._PLAIN_FALLBACK_THRESHOLD:
+            return
+        # If buffer doesn't contain a `{` early on, the model isn't producing JSON.
+        # Switch to plain pass-through mode.
+        early = self._buf[: self._PLAIN_FALLBACK_THRESHOLD]
+        if early.lstrip().startswith("{"):
+            return  # JSON-like start; keep hunting for the marker
+        self._state = "plain"
+
+    def _plain_visible(self) -> str:
+        """Return the cleaned-up buf for plain mode: strip preamble + trailing actions tail."""
+        s = self._PREAMBLE_RE.sub("", self._buf, count=1)
+        s = self._ACTIONS_TAIL_RE.sub("", s)
+        return s
 
     def feed(self, delta: str) -> str:
         if not delta:
@@ -132,10 +163,19 @@ class SpeechStreamExtractor:
         out = ""
         if self._state == "hunting":
             m = self._MARKER_RE.search(self._buf)
-            if m is None:
-                return ""
-            self._pos = m.end()
-            self._state = "in_speech"
+            if m is not None:
+                self._pos = m.end()
+                self._state = "in_speech"
+            else:
+                self._enter_plain_if_needed()
+                if self._state != "plain":
+                    return ""
+        if self._state == "plain":
+            cleaned = self._plain_visible()
+            if len(cleaned) > self._plain_emitted:
+                out = cleaned[self._plain_emitted:]
+                self._plain_emitted = len(cleaned)
+            return out
         if self._state == "in_speech":
             i = self._pos
             buf = self._buf
@@ -166,7 +206,7 @@ class SpeechStreamExtractor:
 
     @property
     def done(self) -> bool:
-        return self._state == "done"
+        return self._state in ("done", "plain")
 
 
 class TTSQueue:
