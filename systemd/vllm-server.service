@@ -1,0 +1,20 @@
+[Unit]
+Description=vLLM server (Qwen3.6-35B-A3B AWQ · 2× RTX 3090 TP=2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/reachy-agent/robot
+Environment="PATH=/usr/local/cuda/bin:/usr/bin:/usr/local/bin"
+Environment="LD_LIBRARY_PATH=/usr/local/cuda/lib64"
+ExecStart=/bin/bash %h/dev/reachy-agent/robot/scripts/vllm_serve.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=300
+LimitNOFILE=65536
+StandardOutput=append:%h/logs/vllm-server.log
+StandardError=append:%h/logs/vllm-server.log
+
+[Install]
+WantedBy=default.target

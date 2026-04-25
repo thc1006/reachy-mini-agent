@@ -1,0 +1,20 @@
+[Unit]
+Description=Reachy Mini brain (LLM + STT + TTS orchestrator on DGX Spark)
+After=network-online.target whisper-server.service
+Wants=network-online.target whisper-server.service
+# Ollama is a system-level service (not user-level), so we just rely on
+# its HTTP endpoint at :11434 being up. robot_brain retries internally.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dev/reachy-agent
+ExecStart=/bin/bash %h/dev/reachy-agent/scripts/run_robot_spark.sh
+Restart=on-failure
+RestartSec=10
+# robot_brain has its own threads + WebRTC stack; give it plenty of FD budget
+LimitNOFILE=65536
+StandardOutput=append:%h/logs/robot-brain.log
+StandardError=append:%h/logs/robot-brain.log
+
+[Install]
+WantedBy=default.target

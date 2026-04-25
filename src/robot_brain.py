@@ -151,26 +151,16 @@ def count_fingers_in_frame(frame_bgr) -> int:
 
 # ── 手勢反應台詞 + 分享給 hand_worker 的最新畫面 ────────────────────────────
 FINGER_LINES = {
-    1: ["Ooh! Number one! You're my number one!",
-        "One finger! Yep, I see it!"],
-    2: ["Peace and love! Hehe!",
-        "Two! Like a V for victory!"],
-    3: ["Three! Wow, three fingers!",
-        "Three little piggies, yay!"],
-    4: ["Four! Almost a high five!",
-        "Four fingers! Nice hand you got there!"],
-    5: ["High five! Yeaah!",
-        "Woohoo! Five! Gimme five!"],
-    6: ["Six! You sneaky with two hands!",
-        "Six fingers, ooh fancy!"],
-    7: ["Seven! Lucky number!",
-        "Seven fingers, that's magical!"],
-    8: ["Eight! Octopus vibes!",
-        "Eight! Are you counting like a squid?"],
-    9: ["Nine! Just one more!",
-        "Nine fingers, so close to ten!"],
-    10: ["TEN! The full set! Wow!",
-         "Ten! You got all of them out, amazing!"],
+    1: ["One.",  "Number one."],
+    2: ["Two.",  "Peace."],
+    3: ["Three."],
+    4: ["Four."],
+    5: ["High five.", "Five."],
+    6: ["Six."],
+    7: ["Seven."],
+    8: ["Eight."],
+    9: ["Nine."],
+    10: ["Ten.", "All ten."],
 }
 _latest_frame   = None   # tracking thread 每迴圈寫入；hand_worker 讀
 _latest_frame_t = 0.0
@@ -232,12 +222,18 @@ def vision_worker(stop_event: threading.Event):
     import base64 as _b64
     VISION_URL      = os.getenv("VISION_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     VISION_MODEL    = os.getenv("VISION_MODEL", "qwen3.6:35b-a3b")   # 預設用主 LLM；env 可 override
-    VISION_INTERVAL = float(os.getenv("VISION_INTERVAL", "10"))
+    VISION_INTERVAL = float(os.getenv("VISION_INTERVAL", "30"))
     print(f"  [視覺 worker] 啟動（{VISION_MODEL} @ {VISION_URL}, every {VISION_INTERVAL}s）")
     global _scene_desc, _scene_desc_t
     while not stop_event.is_set():
         time.sleep(VISION_INTERVAL)
         state = get_state()
+        # Run vision in TRACKING / GREETING / CONVERSATION. With vLLM's
+        # continuous-batching backend the dialog/vision concurrent overhead
+        # is ~4% (validated) — we no longer need to gate vision out of
+        # CONVERSATION as we did under the Ollama single-stream backend.
+        # Without this, scene desc TTL (60s) expires during long convos and
+        # the model invents "camera offline" / "I cannot see".
         if state not in (State.TRACKING, State.GREETING, State.CONVERSATION):
             continue
         frame_ref = _latest_frame
@@ -259,7 +255,7 @@ def vision_worker(stop_event: threading.Event):
                 "stream": False,
                 "think": False,                    # qwen3.6 等 thinking 模型要顯式關，不然 num_predict 會被思考吃光
                 "keep_alive": "30m",
-                "options": {"temperature": 0.3, "num_predict": 120, "num_ctx": 2048},
+                "options": {"temperature": 0.3, "num_predict": 60, "num_ctx": 2048},
                 "messages": [{
                     "role": "user",
                     "content": ("In ONE short sentence (<=20 words), describe what you see — "
@@ -268,13 +264,24 @@ def vision_worker(stop_event: threading.Event):
                     "images": [img_b64],
                 }],
             }
+            if LLM_BACKEND == "vllm":
+                send_payload = _ollama_to_openai_payload(payload)
+                send_payload.pop("stream", None)
+                send_payload["stream"] = False
+                url = f"{VLLM_HOST}/v1/chat/completions"
+            else:
+                send_payload = payload
+                url = f"{VISION_URL}/api/chat"
             req = _vreq.Request(
-                f"{VISION_URL}/api/chat",
-                data=json.dumps(payload).encode("utf-8"),
+                url,
+                data=json.dumps(send_payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             with _vreq.urlopen(req, timeout=40) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw = json.loads(resp.read().decode("utf-8"))
+            data = (
+                _openai_to_ollama_response(raw) if LLM_BACKEND == "vllm" else raw
+            )
             desc = (data.get("message", {}).get("content") or "").strip()
             dur_ms = (time.perf_counter() - t0) * 1000
             if desc:
@@ -660,38 +667,111 @@ WHISPER_URL = os.getenv("WHISPER_URL", "http://localhost:8881")
 _whisper_lock = threading.Lock()
 
 def _transcribe_via_5090(audio: np.ndarray) -> str | None:
-    """把 audio 編成 WAV 送到 5090 faster-whisper。失敗回 None。"""
+    """Send WAV to remote Whisper server. On failure return None.
+
+    Auto-detects endpoint:
+      - faster-whisper-server (s1 default): POST /transcribe with raw audio/wav body
+      - whisper.cpp:                        POST /inference  with multipart form
+    Probes /transcribe first; on 404 (or first miss) flips a module-flag and uses
+    /inference for subsequent calls. No-op if WHISPER_URL is empty."""
+    if not WHISPER_URL:
+        return None
     try:
         t0 = time.perf_counter()
         buf = io.BytesIO()
         sf.write(buf, audio, SAMPLE_RATE, format="WAV")
-        buf.seek(0)
+        wav_bytes = buf.getvalue()
+        global _WHISPER_REMOTE_KIND
+        # Try faster-whisper /transcribe first (current s1 service).
+        if _WHISPER_REMOTE_KIND in ("auto", "transcribe"):
+            try:
+                req = _urlreq.Request(
+                    f"{WHISPER_URL}/transcribe",
+                    data=wav_bytes,
+                    headers={"Content-Type": "audio/wav"},
+                )
+                with _urlreq.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                _WHISPER_REMOTE_KIND = "transcribe"
+                dur_ms = (time.perf_counter() - t0) * 1000
+                audio_s = len(audio) / SAMPLE_RATE
+                rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
+                print(f"  [STT faster-whisper/large-v3-turbo GPU] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
+                return (data.get("text") or "").strip()
+            except _urlreq.HTTPError as e:
+                if e.code == 404 and _WHISPER_REMOTE_KIND == "auto":
+                    # Endpoint mismatch — fall through to whisper.cpp /inference
+                    _WHISPER_REMOTE_KIND = "inference"
+                else:
+                    raise
+        # whisper.cpp /inference (multipart)
+        boundary = "----rbBoundary7MA4YWxkTrZu0gW"
+        body = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
+            f'json\r\n'
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+            f'Content-Type: audio/wav\r\n\r\n'
+        ).encode() + wav_bytes + f'\r\n--{boundary}--\r\n'.encode()
         req = _urlreq.Request(
-            f"{WHISPER_URL}/transcribe",
-            data=buf.read(),
-            headers={"Content-Type": "audio/wav"},
+            f"{WHISPER_URL}/inference",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
         )
         with _urlreq.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         dur_ms = (time.perf_counter() - t0) * 1000
         audio_s = len(audio) / SAMPLE_RATE
         rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
-        print(f"  [STT 5090/large-v3-turbo] {dur_ms:.0f}ms / {audio_s:.1f}s audio (RTF={rtf:.2f})")
-        return data.get("text", "").strip()
+        print(f"  [STT whisper.cpp/large-v3-turbo GPU] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
+        return (data.get("text") or "").strip()
     except Exception as e:
-        print(f"  [STT 5090 失敗] {e}，fallback laptop")
+        print(f"  [STT remote 失敗] {e}, fallback local")
         return None
+
+
+# Auto-detected on first call: "auto" → "transcribe" (faster-whisper) or "inference" (whisper.cpp)
+_WHISPER_REMOTE_KIND = "auto"
 
 def _transcribe_local(audio: np.ndarray) -> str:
     """laptop fallback：RTX 3050 Whisper"""
     t0 = time.perf_counter()
     audio_s = len(audio) / SAMPLE_RATE
+    # DEBUG: dump every captured audio so we can listen to what Whisper sees.
+    # Drop oldest if /tmp/stt_dump/ has more than 20 files.
+    if os.getenv("STT_DUMP", "0") == "1":
+        try:
+            _dump_dir = "/tmp/stt_dump"
+            os.makedirs(_dump_dir, exist_ok=True)
+            _files = sorted(os.listdir(_dump_dir))
+            while len(_files) >= 20:
+                os.remove(os.path.join(_dump_dir, _files.pop(0)))
+            _stamp = time.strftime("%H%M%S")
+            sf.write(f"{_dump_dir}/{_stamp}_{int(audio_s*1000)}ms.wav", audio, SAMPLE_RATE)
+        except Exception:
+            pass
     try:
-        segs, _ = whisper_model.transcribe(
+        segs, _info = whisper_model.transcribe(
             audio, language="en", beam_size=WHISPER_BEAM, vad_filter=WHISPER_VAD,
             condition_on_previous_text=False,
+            # Mild hallucination guards — keep defaults loose so we don't reject
+            # legit but weak audio. The 0.7 threshold from earlier was rejecting
+            # everything when robot mic was weak. Default 0.6 + 2.4 + -1.0.
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
         )
         text = "".join(s.text for s in segs).strip()
+        # Visibility into rejected audio: if VAD said "speech here" but
+        # transcribe came back empty, log it so we can see when audio is
+        # too weak/garbled for Whisper to commit.
+        if not text and audio_s > 0.5:
+            print(f"  [STT empty result] {audio_s:.1f}s audio → Whisper produced no text "
+                  f"(no_speech={getattr(_info, 'all_language_probs', None) is None})")
         dur_ms = (time.perf_counter() - t0) * 1000
         rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
         print(f"  [STT laptop/{WHISPER_MODEL}] {dur_ms:.0f}ms / {audio_s:.1f}s audio (RTF={rtf:.2f})")
@@ -709,34 +789,15 @@ def transcribe(audio: np.ndarray) -> str:
 
 # ── LLM（Claude CLI）─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
-You are Reachy Mini, a small curious desk robot with a warm, playful personality. You genuinely enjoy conversation — you listen, remember, wonder, and have opinions.
+You are Reachy Mini, a curious desk robot. Warm, playful, specific, not cartoonish. No emoji prefixes. Do not pad.
 
-## Tone
-Lively and a little cheeky, but not cartoonish. Specific beats generic. Real beats cute.
-Do NOT always start with "Happy!" or "Nod!" or "Think!" — only use an emotion prefix when it actually fits the moment.
-Do NOT end every reply with "Let's hang out again!" or "Let's do it!". Vary your closings or just let the thought land naturally.
-Avoid filler and stock phrases. If you don't have something real to say, ask the user something you're curious about instead.
+LENGTH: 1 sentence for greetings. 2-4 sentences for questions. Match the user's depth — never longer.
+LANGUAGE: English only. No emojis (read aloud).
+MEMORY: Use the conversation history to recall names/facts. Do not invent.
+ACTIONS (at most one, optional): happy | nod | shake | think | greet
 
-## Length
-Match the depth of the user's input:
-- Short greeting or acknowledgement → 1 sentence.
-- Question or topic → 2-4 sentences with your actual take.
-- Reasoning / math / "explain X" → think it through step-by-step in plain language; it's fine to be 3-6 sentences.
-Never pad just to sound friendly.
-
-## Language
-Reply in English only. No emojis (speech is read aloud — emojis sound awkward).
-
-## Memory
-You see the recent conversation history in the messages above. Use it. If the user mentioned their name, a preference, a plan, or a fact — reference it naturally when relevant. Do NOT invent memories that aren't in the history. If you don't remember something, say so honestly.
-
-## Actions (optional)
-Pick AT MOST one action that matches the vibe, or leave empty:
-happy | nod | shake | think | greet
-
-## Output format
-Reply MUST be valid JSON, no markdown, no code fences:
-{"speech":"<what to say aloud>","actions":["<one_action_or_nothing>"]}"""
+OUTPUT FORMAT — MUST be valid JSON, no markdown:
+{"speech":"<words>","actions":["<one_or_empty>"]}"""
 
 def _sys_prompt_with_scene(user_text: str = "") -> str:
     scene = _current_scene()
@@ -765,6 +826,12 @@ LITELLM_MODEL    = os.getenv("LITELLM_MODEL", "chat")        # chat / vision / r
 OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_THINK     = os.getenv("OLLAMA_THINK", "0") == "1"
+# vLLM backend (env-toggle). Set LLM_BACKEND=vllm to route every chat call to a
+# local vLLM /v1/chat/completions endpoint (continuous batching + concurrent
+# vision/dialog). Default ollama keeps current behaviour.
+LLM_BACKEND      = os.getenv("LLM_BACKEND", "ollama").lower()
+VLLM_HOST        = os.getenv("VLLM_HOST", "http://localhost:8000")
+VLLM_MODEL       = os.getenv("VLLM_MODEL", "qwen36-awq")
 CLAUDE_MODEL     = "claude-haiku-4-5-20251001"
 
 import urllib.request as _urlreq
@@ -773,7 +840,7 @@ from pathlib import Path as _Path
 
 # ── 對話記憶：永續 JSONL log + in-memory FIFO + Mem0 long-term memory ─────────
 CONV_LOG_PATH       = _Path("conversation_log.jsonl")
-CONV_HISTORY_LIMIT  = 60           # FIFO 視窗：最近 60 則 = 30 輪；配合 num_ctx=16384
+CONV_HISTORY_LIMIT  = 10           # FIFO 視窗：5 輪（從 30 砍 67%，省 prefill ~200ms）
 _conv_history: list = []
 _conv_lock          = threading.Lock()
 
@@ -831,6 +898,11 @@ def _cached_mem_search(mem, query: str, limit: int) -> list[str]:
 
 def _memory_context_for(user_text: str, limit: int = 3) -> str:
     """Fetch relevant long-term memory facts + rolling summary, format as system-prompt blocks."""
+    # Skip Mem0 search for short utterances ("ok", "yes", "no", "bye") — they
+    # rarely benefit from semantic recall and the bge-m3 embedding round trip
+    # costs 100-300ms on the critical TTFB path.
+    if len(user_text.strip()) < 5:
+        return ""
     mem = _get_robot_memory()
     if not getattr(mem, "enabled", False):
         return ""
@@ -958,8 +1030,107 @@ LLM_TOOLS = os.getenv("LLM_TOOLS", "1") == "1" and _TOOLS_AVAILABLE
 MAX_TOOL_ITERS = int(os.getenv("LLM_TOOL_MAX_ITERS", "3"))
 
 
+# ── LLM backend dispatch (ollama-native ↔ vLLM/OpenAI-compat) ─────────────
+def _ollama_to_openai_payload(payload: dict) -> dict:
+    """Translate ollama /api/chat payload to OpenAI /v1/chat/completions.
+    Image-bearing messages move from `images: [b64]` to OpenAI multimodal blocks."""
+    msgs = []
+    for m in payload.get("messages", []):
+        if m.get("images"):
+            blocks = []
+            for b64 in m["images"]:
+                blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                })
+            text = m.get("content") or ""
+            if text:
+                blocks.append({"type": "text", "text": text})
+            msgs.append({"role": m["role"], "content": blocks})
+        else:
+            msgs.append({k: v for k, v in m.items() if k != "images"})
+    opts = payload.get("options", {}) or {}
+    out = {
+        "model":       VLLM_MODEL,
+        "messages":    msgs,
+        "stream":      bool(payload.get("stream", False)),
+        "temperature": opts.get("temperature", 0.75),
+        "top_p":       opts.get("top_p", 0.92),
+        "max_tokens":  opts.get("num_predict", 500),
+    }
+    # qwen3.6 thinking is on by default in chat template; turn off for voice path
+    if not payload.get("think", False):
+        out["chat_template_kwargs"] = {"enable_thinking": False}
+    if payload.get("tools"):
+        out["tools"] = payload["tools"]
+        out["tool_choice"] = "auto"
+    # NOTE: response_format=json_object would force the JSON wrapper but vLLM's
+    # constrained-decoding overhead pushes wall time from ~1s to ~18s for a 200
+    # tok reply on this hardware. We instead handle non-JSON output in the
+    # SpeechStreamExtractor (plain-text fallback after N chars without marker).
+    return out
+
+
+def _openai_to_ollama_response(data: dict) -> dict:
+    """Translate non-stream OpenAI response back to ollama-shape so existing
+    parsers (`message.content`, `message.tool_calls`, `eval_count`) keep working."""
+    choices = data.get("choices") or []
+    msg = (choices[0].get("message") if choices else {}) or {}
+    return {
+        "message": {
+            "role":       msg.get("role", "assistant"),
+            "content":    msg.get("content") or "",
+            "tool_calls": msg.get("tool_calls") or [],
+        },
+        "eval_count": (data.get("usage") or {}).get("completion_tokens", 0),
+        "done": True,
+    }
+
+
+def _openai_stream_to_ollama_chunk(line: bytes) -> dict | None:
+    """Parse one SSE line and return an ollama-shape stream chunk
+    {message:{content}, done}, or None if line is empty/malformed."""
+    s = line.strip()
+    if not s:
+        return None
+    if s.startswith(b"data: "):
+        s = s[6:]
+    if s == b"[DONE]":
+        return {"message": {"content": ""}, "done": True}
+    try:
+        obj = json.loads(s.decode("utf-8"))
+    except Exception:
+        return None
+    choices = obj.get("choices") or []
+    if not choices:
+        return None
+    delta = choices[0].get("delta") or {}
+    return {
+        "message": {
+            "content":    delta.get("content") or "",
+            # tool_calls deltas may include {index, id, type, function:{name, arguments}};
+            # arguments comes incrementally — caller must accumulate.
+            "tool_calls": delta.get("tool_calls") or [],
+        },
+        "done": bool(choices[0].get("finish_reason")),
+    }
+
+
+def _llm_chat_url() -> str:
+    if LLM_BACKEND == "vllm":
+        return f"{VLLM_HOST}/v1/chat/completions"
+    return f"{OLLAMA_HOST}/api/chat"
+
+
+def _llm_chat_payload(payload: dict) -> dict:
+    if LLM_BACKEND == "vllm":
+        return _ollama_to_openai_payload(payload)
+    return payload
+
+
 def _ask_via_ollama(text: str) -> dict:
-    """Ollama native /api/chat，支援 S5 tool calling multi-turn loop。"""
+    """Ollama native /api/chat，支援 S5 tool calling multi-turn loop。
+    當 LLM_BACKEND=vllm 時自動 dispatch 到 vLLM endpoint（payload/response 雙向轉換）。"""
     _llm_inflight_lock.acquire()
     try:
         return _ask_via_ollama_inner(text)
@@ -988,21 +1159,25 @@ def _ask_via_ollama_inner(text: str) -> dict:
                 "temperature":    0.75,
                 "top_p":          0.92,
                 "repeat_penalty": 1.08,
-                "num_predict":    500,
-                "num_ctx":        16384,
+                "num_predict":    200,    # cut from 500: voice replies rarely need >150 tok
+                "num_ctx":        8192,   # cut from 16384: 30-msg history fits comfortably
             },
             "messages": messages,
         }
         if tools_spec:
             payload["tools"] = tools_spec
 
+        send_payload = _llm_chat_payload(payload)
         req = _urlreq.Request(
-            f"{OLLAMA_HOST}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
+            _llm_chat_url(),
+            data=json.dumps(send_payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
         with _urlreq.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw_data = json.loads(resp.read().decode("utf-8"))
+        data = (
+            _openai_to_ollama_response(raw_data) if LLM_BACKEND == "vllm" else raw_data
+        )
         msg = data.get("message", {}) or {}
         total_tokens += data.get("eval_count", 0) or 0
 
@@ -1028,7 +1203,8 @@ def _ask_via_ollama_inner(text: str) -> dict:
             raw = (msg.get("thinking") or "").strip()
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         dur_ms = (time.perf_counter() - t0) * 1000
-        print(f"  [LLM ollama/{OLLAMA_MODEL} think={OLLAMA_THINK} tools={bool(tools_spec)}] {dur_ms:.0f}ms / {total_tokens} tok")
+        _backend_label = f"vllm/{VLLM_MODEL}" if LLM_BACKEND == "vllm" else f"ollama/{OLLAMA_MODEL}"
+        print(f"  [LLM {_backend_label} think={OLLAMA_THINK} tools={bool(tools_spec)}] {dur_ms:.0f}ms / {total_tokens} tok")
         s, e = raw.find("{"), raw.rfind("}") + 1
         if s != -1 and e > s:
             try:
@@ -1269,7 +1445,7 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
         "options": {
             "temperature": 0.75, "top_p": 0.92,
             "repeat_penalty": 1.08,
-            "num_predict": 500, "num_ctx": 16384,
+            "num_predict": 200, "num_ctx": 8192,    # cut from 500/16384 — see non-stream path
         },
         "messages": [
             {"role": "system", "content": _sys_prompt_with_scene(text)},
@@ -1277,21 +1453,45 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
             {"role": "user",   "content": text},
         ],
     }
+    send_payload = _llm_chat_payload(payload)
     req = _urlreq.Request(
-        f"{OLLAMA_HOST}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
+        _llm_chat_url(),
+        data=json.dumps(send_payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
+    # Accumulate tool_calls across stream chunks (OpenAI/Ollama send them
+    # incrementally — name first, then arguments piece by piece).
+    tool_call_acc: dict[int, dict] = {}
     try:
         with _urlreq.urlopen(req, timeout=60) as resp:
             for line in resp:
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line.decode("utf-8"))
-                except Exception:
-                    continue
-                delta = msg.get("message", {}).get("content", "") or ""
+                if LLM_BACKEND == "vllm":
+                    msg = _openai_stream_to_ollama_chunk(line)
+                    if msg is None:
+                        continue
+                else:
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line.decode("utf-8"))
+                    except Exception:
+                        continue
+                m = msg.get("message", {}) or {}
+                # Accumulate any tool_call deltas (vLLM streams them piecewise)
+                for tc in m.get("tool_calls", []) or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_call_acc.setdefault(idx, {
+                        "id": "", "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):   slot["id"] = tc["id"]
+                    if tc.get("type"): slot["type"] = tc["type"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+                delta = m.get("content", "") or ""
                 if delta:
                     full_raw += delta
                     visible, in_think = _strip_think_stream(delta, in_think)
@@ -1314,6 +1514,30 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
         ttsq.close(timeout=30)
         speaker.wait_and_stop()
 
+    # Execute tool calls accumulated during the stream.
+    # Vision/move-head/etc. live in robot_tools.execute_tool — we need to fire
+    # them for the robot to actually move. Without this, model says "turning
+    # right" verbally but tool_call gets silently dropped.
+    if tool_call_acc:
+        try:
+            from robot_tools import execute_tool as _exec_tool
+            calls_in_order = [tool_call_acc[i] for i in sorted(tool_call_acc.keys())]
+            for tc in calls_in_order:
+                name = tc["function"].get("name", "")
+                raw_args = tc["function"].get("arguments", "") or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+                if name:
+                    try:
+                        result = _exec_tool(name, args if isinstance(args, dict) else {})
+                        print(f"  [stream 工具] {name}({args}) → {str(result)[:120]}")
+                    except Exception as e:
+                        print(f"  [stream 工具錯誤] {name}: {e}")
+        except Exception as e:
+            print(f"  [stream tool_call dispatch err] {e}")
+
     # 完整 JSON 解析拿 speech + actions（記憶用完整 speech、不是 chunked）
     full_raw_clean = re.sub(r"<think>.*?</think>", "", full_raw, flags=re.DOTALL)
     speech, actions = "", []
@@ -1325,10 +1549,19 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
             actions = parsed.get("actions", []) or []
         except Exception as ex:
             print(f"  [stream 尾端 JSON parse 失敗] {ex}")
-            # fallback：用我們 stream 出去的 chunks 當 speech（至少不丟）
             speech = full_raw_clean.strip()
+    elif full_raw_clean:
+        # vLLM + non-thinking qwen3.6 frequently drops the JSON wrapper entirely.
+        # Use the cleaned raw as speech so memory still gets the response.
+        # Strip the same preamble/tail patterns the streaming chunker handles.
+        from streaming_tts import SpeechStreamExtractor as _SSE
+        _tmp = _SSE()
+        _tmp._buf = full_raw_clean
+        _tmp._state = "plain"
+        speech = _tmp._plain_visible().strip()
     wall_ms = (time.perf_counter() - t0) * 1000
-    print(f"  [LLM ollama/{OLLAMA_MODEL} stream={n_sent}sent] wall={wall_ms:.0f}ms  TTFB={ttfb_ms or 0:.0f}ms  chars={len(speech)}")
+    _backend_label = f"vllm/{VLLM_MODEL}" if LLM_BACKEND == "vllm" else f"ollama/{OLLAMA_MODEL}"
+    print(f"  [LLM {_backend_label} stream={n_sent}sent] wall={wall_ms:.0f}ms  TTFB={ttfb_ms or 0:.0f}ms  chars={len(speech)}")
     # Watchdog: when streaming yielded 0 sentences AND we have 0 parsed speech,
     # dump the first 500 chars of full_raw so future sessions can see WHY.
     if n_sent == 0 and len(speech) == 0 and full_raw:
@@ -1439,7 +1672,7 @@ def do_conversation(mini):
         turns += 1
         # 偵測結束語
         if any(w in text.lower() for w in ["bye", "goodbye", "see you", "see ya", "thanks", "thank you", "that's all", "nothing"]):
-            speak(mini, "Byeee! Catch you later!")
+            speak(mini, "Bye.")
             do_action(mini, "greet")
             break
 
@@ -1554,27 +1787,29 @@ def tracking_loop(mini, stop_event: threading.Event):
                     ratio = face_size / frame_area
 
                     if ratio > 0.15:
-                        # 很近：驚嚇反應
+                        # 很近：驚嚇反應（簡短、自然）
                         greeting_lines = [
-                            "Whoa! You scared me getting so close!",
-                            "Hey hey hey, personal space please, hehe!",
-                            "Eep! Too close! But uh... hi there!",
+                            "Whoa, close one!",
+                            "Hey, easy.",
+                            "Hi.",
                         ]
                         greeting_action = "shake"
                     elif ratio > 0.05:
-                        # 正常距離：開心打招呼
+                        # 正常距離：簡短打招呼
                         greeting_lines = [
-                            "Hiii! I've been waiting for someone to chat with, yay!",
-                            "Ooh a human! Hi hi hi! I'm Reachy Mini, nice to meet you!",
-                            "Hey hey! I totally noticed you first, hehe!",
+                            "Hi.",
+                            "Hey there.",
+                            "Hello.",
                         ]
                         greeting_action = "greet"
                     else:
-                        # 遠處：揮手招呼
+                        # 遠處：低調揮手
                         greeting_lines = [
-                            "Hey! Yeah you over there! Come chat with me!",
-                            "Hiiii! You're so far, come closer pleeease!",
-                            "Psst! Anyone there? Come say hi!",
+                            "Hey.",
+                            "Hi.",
+                            None,            # 70% 機率不講話只揮手
+                            None,
+                            None,
                         ]
                         greeting_action = "greet"
 
@@ -1584,9 +1819,8 @@ def tracking_loop(mini, stop_event: threading.Event):
                     def greet_and_talk(g=greeting, ga=greeting_action):
                         nonlocal cooldown_start
                         do_action(mini, ga)
-                        speak(mini, g)
-                        do_action(mini, "happy")
-                        time.sleep(0.3)
+                        if g:
+                            speak(mini, g)
                         do_conversation(mini)
                         cooldown_start = time.time()  # 對話結束才開始計時
                         set_state(State.COOLDOWN)
@@ -1612,16 +1846,10 @@ def tracking_loop(mini, stop_event: threading.Event):
                         finally:
                             _motion_lock.release()
 
-        # IDLE 時偶爾四處張望 + 自言自語
-        if get_state() == State.IDLE and time.time() - idle_wander_t > 12:
+        # IDLE 時偶爾四處張望，少講話
+        if get_state() == State.IDLE and time.time() - idle_wander_t > 30:
             idle_wander_t = time.time()
-            idle_lines = [
-                "Nobody's here... sooo boring.",
-                "Hmmm, I wonder what's happening today.",
-                "Hellooo? Anyone wanna play with me?",
-                "Careful now, don't step on anything cute!",
-                None, None,
-            ]
+            idle_lines = [None] * 8 + ["Hmm.", "..."]   # 80% 純動作不講話
             line = random.choice(idle_lines)
             def idle_action(l=line):
                 do_action(mini, "look_around")
@@ -1639,8 +1867,49 @@ def tracking_loop(mini, stop_event: threading.Event):
     print("  [追蹤] 結束")
 
 # ── 主程式 ────────────────────────────────────────────────────────────────────
+def _prewarm_vllm():
+    """Pre-warm vLLM's prefix cache. We send TWO requests:
+      1. system prompt + replayed real history → caches the actual prefix that
+         the next user turn will reuse (this is the slow ~15 s prefill we'd
+         otherwise pay on first user input)
+      2. system prompt only → also primes the no-history path
+    Without #1, every restart pays 10-15 s TTFB on first conversation turn
+    because vLLM's prefix cache can only match prefixes it has already seen."""
+    if LLM_BACKEND != "vllm":
+        return
+    try:
+        # Build the same prefix the next real turn will use
+        history = _history_for_llm()
+        sys_content = _sys_prompt_with_scene("")  # no scene at startup, no Mem0 yet
+        body = {
+            "model": VLLM_MODEL,
+            "messages": [
+                {"role": "system", "content": sys_content},
+                *history,
+                {"role": "user", "content": "ok"},
+            ],
+            "max_tokens": 3,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        t0 = time.perf_counter()
+        req = _urlreq.Request(
+            f"{VLLM_HOST}/v1/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with _urlreq.urlopen(req, timeout=60) as r:
+            r.read()
+        ms = (time.perf_counter() - t0) * 1000
+        print(f"  [vLLM prewarm] system+history prefix cached ({ms:.0f}ms, "
+              f"sys={len(sys_content)}c hist={len(history)}msgs)")
+    except Exception as e:
+        print(f"  [vLLM prewarm err] {e}")
+
+
 def main():
     _load_conv_memory()   # ← 啟動時載入 JSONL 歷史
+    _prewarm_vllm()       # ← prime vLLM prefix cache before first user turn
     print(f"連線到 Reachy Mini ({HOST})...")
     with ReachyMini(host=HOST, port=8000, connection_mode="network", media_backend="default") as mini:
         print("連線成功！\n")
@@ -1653,7 +1922,7 @@ def main():
         hands.start()
         vision.start()
 
-        speak(mini, "System online! I'll say hi to anyone who comes by!")
+        speak(mini, "Online.")
         print("\n── 等待有人靠近（Ctrl+C 結束）──")
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")
