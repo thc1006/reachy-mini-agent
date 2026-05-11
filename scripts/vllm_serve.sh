@@ -8,8 +8,13 @@
 # Env toggles (override on launch — bash MTP_K=2 ./vllm_serve.sh):
 #   MTP_K                  default 3 — number of MTP speculative tokens.
 #                          Set 0 to disable spec decoding (v1/v2 baseline).
-#                          k=1 = v3 canonical, k=2 = pre-v4 production,
-#                          k=3 = v4 winner (TTFT −33 % vs k=2, TPOT NS).
+#                          k=1 = v3 canonical, k=2 = pre-v4 production (and
+#                          vLLM Recipes' Qwen3.6 default — see recipes URL
+#                          above), k=3 = v4 winner ON THIS HARDWARE CLASS
+#                          (2× RTX 3090 PCIe + AWQ + vLLM 0.19.1; TTFT −33 %
+#                          vs k=2, TPOT NS). k=3 not validated on single-card
+#                          / NVLink / HBM regimes — Recipes' k=2 is the
+#                          safer starting point off this hardware.
 #   ENABLE_PREFIX_CACHING  default 0 — cache OFF when MTP enabled.
 #                          Set 1 only if MTP_K=0 OR you have a workload
 #                          where vllm-project/vllm#38182 (cache hit rate
