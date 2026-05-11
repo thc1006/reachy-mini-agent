@@ -66,12 +66,47 @@ TTS_VOICE_EN     = "en-US-AnaNeural"        # 可愛小女孩英文聲
 TTS_VOICE_ZH     = "zh-TW-HsiaoYuNeural"    # 可愛台灣女生中文聲
 TTS_VOICE        = TTS_VOICE_EN              # 預設值（被 pick_voice 覆寫）
 
+TTS_VOICE_JA     = "ja-JP-NanamiNeural"     # 日文女聲
+TTS_VOICE_KO     = "ko-KR-SunHiNeural"      # 韓文女聲
+
+
+def _script(c: str) -> str:
+    """Classify char by Unicode block (only what we route on)."""
+    o = ord(c)
+    if 0x4E00 <= o <= 0x9FFF:        return "han"        # CJK Unified Ideographs
+    if 0x3040 <= o <= 0x309F:        return "hiragana"
+    if 0x30A0 <= o <= 0x30FF:        return "katakana"
+    if 0xAC00 <= o <= 0xD7AF:        return "hangul"
+    return "ascii"
+
+
 def _has_chinese(text: str) -> bool:
-    """只要包含 CJK 字元就視為中文"""
-    return any('\u4e00' <= c <= '\u9fff' for c in text)
+    """Back-compat: Han ideographs only (used elsewhere for ZH-specific logic)."""
+    return any(_script(c) == "han" for c in text)
+
 
 def pick_voice(text: str) -> str:
-    return TTS_VOICE_ZH if _has_chinese(text) else TTS_VOICE_EN
+    """Pick TTS voice by dominant non-ASCII script.
+
+    2026-05-11 fix: prior version only checked Han (U+4E00-9FFF); Japanese
+    Hiragana/Katakana and Korean Hangul fell through to en-US voice, which
+    Edge TTS rejects with ``No audio was received`` for non-Latin text.
+    Mixed-script utterances pick the most-frequent non-ASCII script.
+    """
+    counts: dict[str, int] = {}
+    for c in text:
+        s = _script(c)
+        if s != "ascii":
+            counts[s] = counts.get(s, 0) + 1
+    if not counts:
+        return TTS_VOICE_EN
+    top = max(counts, key=counts.get)
+    return {
+        "han":      TTS_VOICE_ZH,
+        "hiragana": TTS_VOICE_JA,
+        "katakana": TTS_VOICE_JA,
+        "hangul":   TTS_VOICE_KO,
+    }[top]
 
 # ── 狀態機 ────────────────────────────────────────────────────────────────────
 class State(enum.Enum):
@@ -756,7 +791,7 @@ def _transcribe_local(audio: np.ndarray) -> str:
             pass
     try:
         segs, _info = whisper_model.transcribe(
-            audio, language="en", beam_size=WHISPER_BEAM, vad_filter=WHISPER_VAD,
+            audio, language=None, beam_size=WHISPER_BEAM, vad_filter=WHISPER_VAD,
             condition_on_previous_text=False,
             # Mild hallucination guards — keep defaults loose so we don't reject
             # legit but weak audio. The 0.7 threshold from earlier was rejecting
