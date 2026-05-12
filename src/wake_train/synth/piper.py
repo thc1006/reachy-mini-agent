@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 VOICE_DIR = Path(os.environ.get("WAKE_TRAIN_VOICES", str(Path.home() / "wake_train" / "voices")))
 
 
+CLIP_DURATION_S: float = 2.0  # pad every positive to >= openWakeWord 16-frame
+                              # window (16 * 80 ms = 1.28 s); 2.0 s leaves room
+                              # for time-shift augmentation and runtime jitter
+
+
 @dataclass(frozen=True)
 class SynthSpec:
     voice: str
@@ -40,6 +45,20 @@ class SynthSpec:
 
     def filename(self) -> str:
         return f"{self.seed:04d}.wav"
+
+
+def _pad_to_duration(pcm16: np.ndarray, sample_rate: int, duration_s: float,
+                     rng: np.random.Generator) -> np.ndarray:
+    target = int(round(duration_s * sample_rate))
+    if pcm16.size >= target:
+        # already long enough — center-crop so the phrase stays inside
+        start = (pcm16.size - target) // 2
+        return pcm16[start:start + target]
+    # random leading silence so the phrase doesn't always sit flush-left
+    head = int(rng.integers(0, target - pcm16.size + 1))
+    out = np.zeros(target, dtype=pcm16.dtype)
+    out[head:head + pcm16.size] = pcm16
+    return out
 
 
 def _jitter_params(rng: np.random.Generator) -> tuple[float, float, float]:
@@ -99,6 +118,7 @@ def synthesize_phrase_set(
     records: list[dict] = []
 
     voice_cache: dict[str, PiperVoice] = {}
+    pad_rng = np.random.default_rng(seed + 7)
 
     for spec in plan(voices, phrases, n_per_voice_phrase, seed=seed):
         if spec.voice not in voice_cache:
@@ -130,6 +150,7 @@ def synthesize_phrase_set(
             pcm16 = (((1.0 - frac) * pcm16[idx0] + frac * pcm16[idx1])
                      .astype(np.int16))
 
+        pcm16 = _pad_to_duration(pcm16, sample_rate, CLIP_DURATION_S, pad_rng)
         sf.write(str(wav_path), pcm16, sample_rate, subtype="PCM_16")
         records.append({
             "voice": spec.voice,

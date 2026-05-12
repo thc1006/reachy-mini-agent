@@ -1,23 +1,23 @@
-"""ONNX runtime latency probe — mirrors _oww_baseline.py.
+"""ONNX-runtime latency probe — drives the exported head with random
+16-frame embedding windows. Mirrors _oww_baseline.py's measurement style.
 
-Drives the exported head with random embedding-shaped windows and reports
-percentile per-frame latency. Use on the 5090 (x86) for a quick sanity check;
-the authoritative Pi 4 number comes from copying the ONNX to the robot and
-re-running _oww_baseline.py with the new path.
+Authoritative Pi 4 numbers come from copying the ONNX to the robot and
+running scripts/wake_train/verify_pi.sh against Phase B1's baseline harness;
+this x86 probe is a quick sanity check that no regression slipped into the
+trained head.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import statistics
 import time
-from pathlib import Path
 
 import numpy as np
 
 from ..config import WakeConfig
-from ..export import OWW_FRAME_STACK
+from ..export import EMBEDDING_DIM
+from ..train import FRAME_STACK
 
 log = logging.getLogger(__name__)
 
@@ -29,13 +29,9 @@ def measure(cfg: WakeConfig, n_frames: int = 1000) -> dict:
         raise FileNotFoundError(f"missing onnx: {cfg.onnx_path}")
     sess = ort.InferenceSession(str(cfg.onnx_path), providers=["CPUExecutionProvider"])
     inp = sess.get_inputs()[0]
-    shape = list(inp.shape)
-    if shape[0] in (None, "batch", -1):
-        shape[0] = 1
     rng = np.random.default_rng(123)
-    sample = rng.standard_normal(tuple(shape)).astype(np.float32)
+    sample = rng.standard_normal((1, FRAME_STACK, EMBEDDING_DIM)).astype(np.float32)
 
-    # warmup
     for _ in range(20):
         sess.run(None, {inp.name: sample})
 
