@@ -111,6 +111,7 @@ def synthesize_phrase_set(
     Lazily imports piper-tts so unit tests don't need it installed.
     """
     from piper import PiperVoice  # lazy
+    from piper.config import SynthesisConfig
     import soundfile as sf
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -130,18 +131,22 @@ def synthesize_phrase_set(
         wav_dir.mkdir(parents=True, exist_ok=True)
         wav_path = wav_dir / spec.filename()
 
-        audio_bytes = bytearray()
-        for chunk in v.synthesize_stream_raw(
-            spec.phrase.text,
+        syn_cfg = SynthesisConfig(
             length_scale=spec.length_scale,
             noise_scale=spec.noise_scale,
-            noise_w=spec.noise_w,
-        ):
-            audio_bytes.extend(chunk)
+            noise_w_scale=spec.noise_w,
+        )
+        parts: list[np.ndarray] = []
+        voice_sr: int | None = None
+        for chunk in v.synthesize(spec.phrase.text, syn_config=syn_cfg):
+            parts.append(np.asarray(chunk.audio_int16_array, dtype=np.int16))
+            voice_sr = chunk.sample_rate
+        if not parts or voice_sr is None:
+            raise RuntimeError(f"Piper produced no audio for {spec.voice}/{spec.phrase.slug}")
+        pcm16 = np.concatenate(parts)
 
-        pcm16 = np.frombuffer(bytes(audio_bytes), dtype=np.int16)
-        if v.config.sample_rate != sample_rate:
-            ratio = sample_rate / v.config.sample_rate
+        if voice_sr != sample_rate:
+            ratio = sample_rate / voice_sr
             new_len = int(round(pcm16.size * ratio))
             x = np.linspace(0.0, pcm16.size - 1, new_len, dtype=np.float64)
             idx0 = np.floor(x).astype(np.int64)
