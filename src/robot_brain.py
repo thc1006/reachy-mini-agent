@@ -542,13 +542,16 @@ def _tts_cache_report_maybe():
     _tts_cache_stats["last_report_t"] = now
 
 async def _fetch_edge_tts(text: str):
-    """Returns (samples, sr) or None on failure (network down, no audio, etc.)."""
-    # pick_voice routes by dominant non-ASCII script: han→zh-TW HsiaoYu (the
-    # "Google 小姐" style Taiwanese female), hiragana/katakana→ja-JP Nanami,
-    # hangul→ko-KR SunHi, else en-US Ana. The hardcoded TTS_VOICE_EN was a
-    # legacy default that made Chinese replies sound mangled in an English
-    # speaker - fixed 2026-05-12.
-    voice = pick_voice(text)
+    """Returns (samples, sr) or None on failure (network down, no audio, etc.).
+
+    Voice selection order:
+      1. TTS_VOICE env override — lock to a single voice for all output
+         (e.g. TTS_VOICE=zh-TW-HsiaoYuNeural makes English get read by the
+         Chinese female voice = "Google 小姐" Chinese-accented English).
+      2. pick_voice(text) — auto-route by dominant script (han→zh-TW,
+         hiragana/katakana→ja-JP, hangul→ko-KR, else en-US).
+    """
+    voice = os.getenv("TTS_VOICE", "").strip() or pick_voice(text)
     cache_path = _edge_cache_path(text, voice)
     if cache_path.exists():
         try:
