@@ -170,29 +170,48 @@ class Dialog:
 
         # ---- in-order playback ------------------------------------------
         # Wait for each future in submission order, play it, then move on.
+        # Track speak-window state so we ALWAYS close it on the way out,
+        # even when the producer dies mid-stream or fut.result() raises.
+        # Otherwise Perception._speaking (set on first AudioSpeakStarted)
+        # only clears on AudioSpeakEnded(last=True) → silent deadlock of
+        # the next turn's mic-gate wait.
         next_idx = 0
         first_audio_at: Optional[float] = None
         last_idx = self.cfg.llm_chunk_count - 1
-        while next_idx <= last_idx:
-            # Wait until producer has submitted the future for next_idx.
-            while next_idx >= len(chunk_futures):
-                if not prod_thread.is_alive():
+        any_started = False
+        last_closed = False
+        try:
+            while next_idx <= last_idx:
+                # Wait until producer has submitted the future for next_idx.
+                while next_idx >= len(chunk_futures):
+                    if not prod_thread.is_alive():
+                        break
+                    time.sleep(0.002)
+                if next_idx >= len(chunk_futures):
+                    # producer exited without emitting all chunks; bail
+                    # cleanly — finally below will close the speak window
                     break
-                time.sleep(0.002)
-            if next_idx >= len(chunk_futures):
-                # producer exited without emitting all chunks; bail cleanly
-                break
-            fut = chunk_futures[next_idx]
-            samples = fut.result()
-            self.bus.publish(AudioSpeakStarted(chunk_idx=next_idx))
-            if first_audio_at is None:
-                first_audio_at = time.perf_counter()
-                self.stats.last_ttfb_audio_ms = (first_audio_at - t_final) * 1000.0
-            time.sleep(self.cfg.tts_play_ms_per_chunk / 1000.0)
-            self.bus.publish(AudioSpeakEnded(
-                chunk_idx=next_idx, last=(next_idx == last_idx),
-            ))
-            next_idx += 1
+                fut = chunk_futures[next_idx]
+                samples = fut.result()
+                self.bus.publish(AudioSpeakStarted(chunk_idx=next_idx))
+                any_started = True
+                if first_audio_at is None:
+                    first_audio_at = time.perf_counter()
+                    self.stats.last_ttfb_audio_ms = (first_audio_at - t_final) * 1000.0
+                time.sleep(self.cfg.tts_play_ms_per_chunk / 1000.0)
+                is_last = (next_idx == last_idx)
+                self.bus.publish(AudioSpeakEnded(chunk_idx=next_idx, last=is_last))
+                if is_last:
+                    last_closed = True
+                next_idx += 1
+        finally:
+            if any_started and not last_closed:
+                try:
+                    self.bus.publish(AudioSpeakEnded(
+                        chunk_idx=max(0, next_idx - 1), last=True,
+                    ))
+                except Exception:
+                    pass
 
         prod_thread.join(timeout=2.0)
         speech = " ".join(self._SENTENCES[: self.cfg.llm_chunk_count])

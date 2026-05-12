@@ -158,10 +158,17 @@ class Perception:
         # interval from the baseline. Only wired up when
         # ``enable_on_demand_vision=True``.
         def _run():
-            time.sleep(self.cfg.vision_caption_ms / 1000.0)
-            self.bus.publish(SceneDescribed(
-                text="(simulated) the user is sitting in front of a laptop"
-            ))
+            try:
+                time.sleep(self.cfg.vision_caption_ms / 1000.0)
+                self.bus.publish(SceneDescribed(
+                    text="(simulated) the user is sitting in front of a laptop"
+                ))
+            except Exception:
+                # The thread can wake after bus.stop() — publish would
+                # raise. Swallow: missing one caption during shutdown is
+                # harmless, and a noisy stack trace would obscure the
+                # real shutdown sequence.
+                pass
         threading.Thread(target=_run, daemon=True,
                          name="perception-vision-ondemand").start()
 

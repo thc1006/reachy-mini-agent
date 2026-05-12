@@ -163,6 +163,12 @@ class EventBus:
     def publish(self, event: Event) -> None:
         if not self._started:
             raise RuntimeError("publish() before start()")
+        if self._stopping:
+            # Bus is draining; events enqueued now would land behind the
+            # shutdown sentinel and never be processed. Silently drop so
+            # producers racing with stop() don't see a partially-handled
+            # event stream.
+            return
         if event.ts == 0.0:
             event.ts = time.time()
         topic = type(event).topic

@@ -71,23 +71,36 @@ except Exception as _orch_imp_err:    # pragma: no cover — older deploy host
 
 _bus = None
 _bus_lock = threading.Lock()
+_bus_disabled = False  # latches True if EventBus.start() ever fails
 
 
 def _get_bus():
     """Lazy singleton EventBus. Returns None if the orchestrator package
-    is unavailable. Safe to call from any thread."""
+    is unavailable OR if a previous start() attempt failed (latched).
+    Safe to call from any thread; never raises into the caller's path.
+
+    The latch matters on hot paths (face.seen fires per-frame ~50Hz):
+    without it, a single start() failure would cause every subsequent
+    publish call to retry construction + spam logs + add latency.
+    """
     global _bus
-    if _bus is not None or not _HAS_ORCHESTRATOR:
+    if _bus is not None:
         return _bus
+    if not _HAS_ORCHESTRATOR or _bus_disabled:
+        return None
     with _bus_lock:
         if _bus is not None:
             return _bus
+        if _bus_disabled:    # racer set it between the outer check and the lock
+            return None
         try:
             b = _OrchEventBus()
             b.start()
             _bus = b
         except Exception as e:
-            print(f"  [bus] start failed: {e}", flush=True)
+            print(f"  [bus] start failed, disabling future attempts: {e}",
+                  flush=True)
+            globals()["_bus_disabled"] = True
     return _bus
 
 
