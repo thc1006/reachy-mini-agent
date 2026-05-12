@@ -1129,7 +1129,9 @@ Examples (bilingual, ACTUAL tool names):
   "look left / 看左邊"                 → move_head(yaw=-15)
   "look at me / 看著我"                → move_head
   "be happy / 開心點 / 高興一下"        → play_emotion(name="happy")
-  "dance / 跳個舞 / 想看你跳"            → play_emotion(name="happy")   # no dedicated dance tool — pick the liveliest emotion
+  "dance / 跳個舞 / 想看你跳"            → play_emotion(name="dance")   # generic dance, or specific name like "jackson_square"
+  "shake your head / 搖頭"              → play_emotion(name="shake")
+  "nod / 點頭"                         → play_emotion(name="nod")
   "stop / 停下 / 別動了"                → stop_motion()
   "what do you see / 你看到什麼"        → see_what()
   "is anyone there / 有人在嗎"          → find_in_view(description="people")
