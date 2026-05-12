@@ -2107,8 +2107,14 @@ def do_conversation(mini):
         if speech:
             _log_turn(text, speech)     # 永續記憶 + in-memory append
         turns += 1
-        # 偵測結束語
-        if any(w in text.lower() for w in ["bye", "goodbye", "see you", "see ya", "thanks", "thank you", "that's all", "nothing"]):
+        # 偵測結束語 (中英雙語)。注意中文部分不能用 .lower()(無大小寫),
+        # 直接子字串比對 raw text。
+        _EN_EXIT = ("bye", "goodbye", "see you", "see ya", "thanks", "thank you",
+                    "that's all", "nothing")
+        _ZH_EXIT = ("掰掰", "拜拜", "再見", "再见", "謝謝", "谢谢",
+                    "沒事了", "没事了", "沒了", "没了", "就這樣", "就这样")
+        _t_low = text.lower()
+        if any(w in _t_low for w in _EN_EXIT) or any(w in text for w in _ZH_EXIT):
             speak(mini, "掰掰。")
             do_action(mini, "greet")
             break

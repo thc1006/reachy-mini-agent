@@ -278,18 +278,28 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
     return result
 
 
-def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_clip") -> None:
-    """Spawn a one-shot timer that queries the daemon for the actual head pose
-    after a recorded-move clip is expected to finish, then syncs that into
-    robot_brain's face-tracker baseline. Without this, the baseline stays at
-    its pre-clip value, the head is physically elsewhere after the clip plays,
-    and the next face-tracker frame races toward the stale baseline causing
-    a 20-30° instant snap (the symptom the delta-clamp was meant to prevent).
+_resync_timer_lock = _threading.Lock()
+_resync_timer: _threading.Timer | None = None
 
-    The daemon exposes GET /api/state/present_head_pose returning pitch/yaw/roll
-    in degrees. On failure (network / unknown format), falls back to a neutral
-    (0, 0) baseline — most pollen-robotics clips return to neutral, so this is
-    a reasonable last-resort default.
+
+def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_clip") -> None:
+    """Schedule a debounced one-shot baseline resync after a recorded-move
+    clip is expected to finish. Queries the daemon for the actual head pose
+    and writes it into robot_brain's face-tracker baseline. Without this,
+    the baseline stays at its pre-clip value while the head physically
+    elsewhere — the next face-tracker frame races toward the stale baseline
+    causing a 20-30° instant snap (the symptom the delta-clamp was meant
+    to prevent).
+
+    Debounce: if a previous resync timer is still pending, cancel it. A
+    second clip fired before the first resync completes supersedes the
+    first — only the LAST clip's expected end time matters. Otherwise N
+    overlapping Timers would create out-of-order baseline writes.
+
+    Daemon endpoint: GET /api/state/present_head_pose → {pitch, yaw, roll}.
+    On failure (network / unknown format), falls back to neutral (0, 0) —
+    most pollen-robotics clips return to neutral, so this is a reasonable
+    last-resort default.
     """
     def _do_sync() -> None:
         pitch, yaw = 0.0, 0.0
@@ -308,9 +318,18 @@ def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_cli
                                   body_yaw_rad=None, source=source)
         except Exception:
             pass
-    t = _threading.Timer(max(0.5, float(delay_s)), _do_sync)
-    t.daemon = True
-    t.start()
+
+    global _resync_timer
+    with _resync_timer_lock:
+        # Cancel any pending resync — last clip wins, no overlapping writes.
+        if _resync_timer is not None:
+            try:
+                _resync_timer.cancel()
+            except Exception:
+                pass
+        _resync_timer = _threading.Timer(max(0.5, float(delay_s)), _do_sync)
+        _resync_timer.daemon = True
+        _resync_timer.start()
 
 _DANCES_LIB   = "pollen-robotics/reachy-mini-dances-library"
 _EMOTIONS_LIB = "pollen-robotics/reachy-mini-emotions-library"
@@ -433,7 +452,8 @@ def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
             _schedule_face_baseline_resync(source=f"after_dance:{n}")
         return result
 
-    # 2. Generic "dance" intent → first dance in library (alphabetical, deterministic)
+    # 2. Generic "dance" intent → prefer "yeah_nod" (short + friendly default);
+    #    fall back to alphabetically-first available dance if yeah_nod is gone.
     if n in {"dance", "dancing", "boogie", "groove", "jig"}:
         pick = "yeah_nod" if "yeah_nod" in dances else (sorted(dances)[0] if dances else "yeah_nod")
         ds = _urlparse.quote(_DANCES_LIB, safe="")
@@ -604,10 +624,14 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
     "play_emotion": (
         _spec("play_emotion",
               "Play a pre-recorded animation: emotion OR dance. "
-              "Dances: dance | yeah_nod | jackson_square | dizzy_spin | groovy_sway_and_roll | side_to_side_sway | pendulum_swing | grid_snap | chicken_peck | head_tilt_roll | uh_huh_tilt | side_peekaboo. "
-              "Emotions: happy | sad | curious | thoughtful | greet | nod | shake | surprised | scared | proud | loving | confused | shy | tired | enthusiastic | grateful | bored | frustrated | angry | calm | welcome | listening. "
-              "Use 'dance' for a generic dance, or a specific dance/emotion name.",
-              {"name": {"type": "string", "description": "Animation name — 'dance' for generic dance, or a specific name from the lists above."}},
+              "Pass 'dance' for a generic dance, or any specific clip name from "
+              "the official pollen-robotics reachy-mini-{dances,emotions}-library "
+              "datasets (discovered dynamically from the daemon at runtime; "
+              "common aliases like happy/sad/curious/proud/loving/scared/tired/"
+              "confused/calm/welcome map to canonical emotion clips). "
+              "Examples — dances: yeah_nod, jackson_square, dizzy_spin, "
+              "groovy_sway_and_roll. Emotions: happy, sad, curious, surprised.",
+              {"name": {"type": "string", "description": "Animation name. Use 'dance' for a generic dance, or a specific clip name (dance or emotion). Unknown names return an error with hints."}},
               required=["name"]),
         _tool_play_emotion,
     ),
