@@ -60,6 +60,9 @@ def export(cfg: WakeConfig) -> ExportResult:
     dummy = torch.zeros(1, FRAME_STACK, EMBEDDING_DIM)
 
     cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # dynamo=False forces the legacy TorchScript exporter, which is what
+    # produced the bundled openWakeWord v0.1 heads and does not require the
+    # onnxscript dep that torch 2.6+ pulls in by default.
     torch.onnx.export(
         wrapped,
         dummy,
@@ -67,6 +70,7 @@ def export(cfg: WakeConfig) -> ExportResult:
         input_names=[BUNDLED_INPUT_NAME],
         output_names=["score"],
         opset_version=15,
+        dynamo=False,
     )
     size = cfg.onnx_path.stat().st_size
 
