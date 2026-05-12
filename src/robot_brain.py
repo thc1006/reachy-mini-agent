@@ -543,7 +543,12 @@ def _tts_cache_report_maybe():
 
 async def _fetch_edge_tts(text: str):
     """Returns (samples, sr) or None on failure (network down, no audio, etc.)."""
-    voice = TTS_VOICE_EN
+    # pick_voice routes by dominant non-ASCII script: han→zh-TW HsiaoYu (the
+    # "Google 小姐" style Taiwanese female), hiragana/katakana→ja-JP Nanami,
+    # hangul→ko-KR SunHi, else en-US Ana. The hardcoded TTS_VOICE_EN was a
+    # legacy default that made Chinese replies sound mangled in an English
+    # speaker - fixed 2026-05-12.
+    voice = pick_voice(text)
     cache_path = _edge_cache_path(text, voice)
     if cache_path.exists():
         try:
