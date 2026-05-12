@@ -2042,6 +2042,17 @@ def tracking_loop(mini, stop_event: threading.Event):
             cy = y + fh / 2
             dx = (cx - w / 2) / (w / 2)
             dy = (cy - h / 2) / (h / 2)
+            # B2 step 3: additive face.seen publish (observability only).
+            # Setpoint math + state-machine transitions below are unchanged.
+            # face.seen fires per-frame (~50Hz); subscribers should use
+            # DROP_OLDEST on a small bounded queue (see Motion actor POC).
+            if _OrchFaceSeen is not None:
+                _bus_publish(_OrchFaceSeen(
+                    bbox=(x, y, fw, fh),
+                    dx=dx, dy=dy,
+                    conf=float(best[-1]),
+                    frame_ts=time.time(),
+                ))
             # 指數移動平均平滑 dx/dy，減少跳動
             smooth_dx = SMOOTH_ALPHA * dx + (1 - SMOOTH_ALPHA) * smooth_dx
             smooth_dy = SMOOTH_ALPHA * dy + (1 - SMOOTH_ALPHA) * smooth_dy
@@ -2135,6 +2146,11 @@ def tracking_loop(mini, stop_event: threading.Event):
                     face_lost_count = 0
                     smooth_dx, smooth_dy = 0.0, 0.0  # 重置平滑值
                     set_state(State.IDLE)
+                    # B2 step 3: additive face.lost publish (edge-triggered;
+                    # only fires on the DETECTED/TRACKING → IDLE transition,
+                    # matching the existing recenter trigger).
+                    if _OrchFaceLost is not None:
+                        _bus_publish(_OrchFaceLost(last_seen_ts=time.time()))
                     # 臉沒了就把頭轉回中間，不要卡在偏向的位置
                     # ⚠️ 必用 goto_target + duration：tracking loop 用 set_target 是即時
                     # streaming setpoint、底層 50Hz 平滑；但這裡是離散一次性 reset、若
