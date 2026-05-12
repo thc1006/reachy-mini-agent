@@ -1636,14 +1636,43 @@ class _RobotSpeaker:
 
 class _StreamTTSEngine:
     """TTSQueue.engine 介面：同步 synthesize(text) → (samples, sr)。
-    沿用既有 _fetch_edge_tts / _fetch_kokoro_tts 的 LRU cache 與 fallback。"""
+    沿用既有 _fetch_edge_tts / _fetch_kokoro_tts / _fetch_hagen_tts 的
+    LRU cache 與 fallback。Engine 選擇與 hybrid routing 必須跟
+    _stream_tts() 保持一致 — 否則 streaming 路徑會跟 speak() 走不同 voice。"""
+    # Module-level regex (reused per call). Same pattern as _stream_tts.
+    _HAGEN_EDGE_INTRO_PATTERNS = re.compile(
+        r"(嗨我是|你好我是|我是瑞奇|hello.{0,20}reachy|hi[\s,.]+(i'?m|i am|my name).{0,15}reachy|^好的$|^好喔$|^是$|^對$|^不是$|^OK$|^好$)",
+        re.IGNORECASE,
+    )
+
     def synthesize(self, text):
         clean = _strip_emoji(text)
         if not clean:
             return np.zeros((1, 2), dtype=np.float32), SAMPLE_RATE
         engine = os.getenv("TTS_ENGINE", "edge").lower()
         result = None
-        if engine == "edge":
+        if engine == "hagen":
+            # Mirror the hybrid routing in _stream_tts so streaming sentences
+            # use the same voice path as one-shot speak() calls.
+            HAGEN_MIN_LEN = int(os.getenv("HAGEN_MIN_LEN", "12"))
+            force_edge = (
+                len(clean.strip()) < HAGEN_MIN_LEN
+                or bool(self._HAGEN_EDGE_INTRO_PATTERNS.search(clean))
+            )
+            try:
+                if force_edge:
+                    result = asyncio.run(_fetch_edge_tts(clean))
+                    if result is None:
+                        result = asyncio.run(_fetch_hagen_tts(clean))
+                else:
+                    result = asyncio.run(_fetch_hagen_tts(clean))
+                    if result is None:
+                        result = asyncio.run(_fetch_edge_tts(clean))
+            except Exception as e:
+                print(f"  [TTS hagen/edge err] {e}")
+            if result is None:
+                result = _fetch_kokoro_tts(clean)
+        elif engine == "edge":
             try:
                 result = asyncio.run(_fetch_edge_tts(clean))
             except Exception as e:
@@ -1658,7 +1687,7 @@ class _StreamTTSEngine:
                 except Exception as e:
                     print(f"  [TTS edge err] {e}")
         if result is None:
-            raise RuntimeError(f"both TTS engines failed for: {clean[:40]!r}")
+            raise RuntimeError(f"all TTS engines failed for: {clean[:40]!r}")
         return result
 
 
