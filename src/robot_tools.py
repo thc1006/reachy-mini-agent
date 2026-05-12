@@ -278,6 +278,41 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
 import urllib.parse as _urlparse
 import threading as _threading
 
+
+def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_clip") -> None:
+    """Spawn a one-shot timer that queries the daemon for the actual head pose
+    after a recorded-move clip is expected to finish, then syncs that into
+    robot_brain's face-tracker baseline. Without this, the baseline stays at
+    its pre-clip value, the head is physically elsewhere after the clip plays,
+    and the next face-tracker frame races toward the stale baseline causing
+    a 20-30° instant snap (the symptom the delta-clamp was meant to prevent).
+
+    The daemon exposes GET /api/state/present_head_pose returning pitch/yaw/roll
+    in degrees. On failure (network / unknown format), falls back to a neutral
+    (0, 0) baseline — most pollen-robotics clips return to neutral, so this is
+    a reasonable last-resort default.
+    """
+    def _do_sync() -> None:
+        pitch, yaw = 0.0, 0.0
+        try:
+            req = _urlreq.Request(f"{DAEMON_BASE}/api/state/present_head_pose")
+            with _urlreq.urlopen(req, timeout=3) as resp:
+                pose = _json.loads(resp.read().decode("utf-8"))
+            if isinstance(pose, dict):
+                pitch = float(pose.get("pitch", 0.0))
+                yaw   = float(pose.get("yaw", 0.0))
+        except Exception:
+            pass  # fall through to neutral baseline
+        try:
+            import robot_brain as _rb
+            _rb.note_head_command(pitch_deg=pitch, yaw_deg=yaw,
+                                  body_yaw_rad=None, source=source)
+        except Exception:
+            pass
+    t = _threading.Timer(max(0.5, float(delay_s)), _do_sync)
+    t.daemon = True
+    t.start()
+
 _DANCES_LIB   = "pollen-robotics/reachy-mini-dances-library"
 _EMOTIONS_LIB = "pollen-robotics/reachy-mini-emotions-library"
 
@@ -386,28 +421,44 @@ def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
     dances   = _get_dance_names()
     emotions = _get_emotion_clip_names()
 
+    # All four playback branches below schedule a baseline resync ~5 s after
+    # firing so the face tracker doesn't race back to its stale pre-clip
+    # baseline. See _schedule_face_baseline_resync for rationale.
+
     # 1. Direct dance-library hit (dynamic — covers any name pollen publishes)
     if n in dances:
         ds = _urlparse.quote(_DANCES_LIB, safe="")
-        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_dance:{n}")
+        return result
 
     # 2. Generic "dance" intent → first dance in library (alphabetical, deterministic)
     if n in {"dance", "dancing", "boogie", "groove", "jig"}:
         pick = "yeah_nod" if "yeah_nod" in dances else (sorted(dances)[0] if dances else "yeah_nod")
         ds = _urlparse.quote(_DANCES_LIB, safe="")
-        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{pick}")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{pick}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_dance:{pick}")
+        return result
 
     # 3. Direct emotion-library hit (dynamic — covers ALL clips, e.g. dance3,
     #    enthusiastic2, proud3, yes_sad1, oops2, understanding2 — beyond aliases)
     if n in emotions:
         ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
-        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_emotion:{n}")
+        return result
 
     # 4. English-friendly alias (LLM emits "happy" → cheerful1, etc.)
     if n in _EMOTION_ALIAS:
         clip = _EMOTION_ALIAS[n]
         ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
-        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{clip}")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{clip}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_emotion:{clip}")
+        return result
 
     # 5. Unknown — hint at available categories without dumping 100 names
     hint_dances = sorted(list(dances))[:6] if dances else []
