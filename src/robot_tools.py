@@ -272,20 +272,99 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
     return result
 
 
-def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
-    """Play a pre-baked emotion animation: happy | sad | curious | think | greet.
+import urllib.parse as _urlparse
 
-    NOTE: motion speed of these animations is controlled by the daemon's
-    pre-recorded move dataset and is NOT under this handler's control. If
-    any specific emotion plays too fast and startles the user, the fix is
-    on the daemon side (re-record or add speed param). See memory:
-    reference_reachy_mini_wireless_motor.md "動作絕對不能瞬間啟動" rule.
+_DANCES_LIB   = "pollen-robotics/reachy-mini-dances-library"
+_EMOTIONS_LIB = "pollen-robotics/reachy-mini-emotions-library"
+
+# 19 dance moves verified on daemon list endpoint (2026-05-13).
+_DANCE_NAMES = {
+    "yeah_nod", "chicken_peck", "chin_lead", "dizzy_spin", "grid_snap",
+    "groovy_sway_and_roll", "head_tilt_roll", "interwoven_spirals",
+    "jackson_square", "neck_recoil", "pendulum_swing", "polyrhythm_combo",
+    "sharp_side_tilt", "side_glance_flick", "side_peekaboo",
+    "side_to_side_sway", "simple_nod", "stumble_and_recover", "uh_huh_tilt",
+}
+
+# LLM-friendly English names → emotions-library clip names. 80+ clips
+# available; this maps the common English emotion words an LLM would emit.
+_EMOTION_ALIAS = {
+    "happy": "cheerful1", "cheerful": "cheerful1", "joyful": "laughing1",
+    "laugh": "laughing1", "laughing": "laughing1",
+    "sad": "sad1", "lonely": "lonely1", "downcast": "downcast1",
+    "curious": "curious1", "think": "thoughtful1", "thoughtful": "thoughtful1",
+    "greet": "welcoming1", "welcome": "welcoming1", "hello": "welcoming1",
+    "shake": "no1", "no": "no1",
+    "nod": "yes1", "yes": "yes1",
+    "surprised": "surprised1", "amazed": "amazed1",
+    "scared": "scared1", "fear": "fear1", "anxious": "anxiety1",
+    "proud": "proud1", "success": "success1", "victory": "success1",
+    "tired": "tired1", "exhausted": "exhausted1", "sleep": "sleep1",
+    "loving": "loving1", "love": "loving1", "grateful": "grateful1",
+    "confused": "confused1", "uncertain": "uncertain1",
+    "shy": "shy1", "embarrassed": "shy1",
+    "frustrated": "frustrated1", "angry": "rage1", "rage": "rage1",
+    "furious": "furious1", "annoyed": "irritated1", "irritated": "irritated1",
+    "displeased": "displeased1", "contempt": "contempt1",
+    "bored": "boredom1", "boredom": "boredom1",
+    "indifferent": "indifferent1", "uncomfortable": "uncomfortable1",
+    "relief": "relief1", "serenity": "serenity1", "calm": "calming1",
+    "enthusiastic": "enthusiastic1", "energetic": "enthusiastic1",
+    "attentive": "attentive1", "listening": "attentive1",
+    "helpful": "helpful1", "understand": "understanding1",
+    "inquiring": "inquiring1", "asking": "inquiring1",
+    "incomprehensible": "incomprehensible2", "lost": "lost1",
+    "oops": "oops1", "mistake": "oops1", "reprimand": "reprimand1",
+    "impatient": "impatient1", "resigned": "resigned1",
+    "go_away": "go_away1", "come": "come1",
+    "electric": "electric1", "dying": "dying1", "die": "dying1",
+}
+
+
+def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
+    """Play a pre-recorded animation (emotion OR dance) from official HF libraries.
+
+    Routing:
+      1. name in dances library (19 names: yeah_nod / chicken_peck / chin_lead / ...)
+         → play directly from pollen-robotics/reachy-mini-dances-library
+      2. name == "dance" / "dancing" / "boogie" / "groove" → default dance "yeah_nod"
+      3. name in alias map (happy / cheerful / sad / curious / proud / loving ...)
+         → translate to clip and play from emotions library
+      4. name matches an emotions-library clip exactly (e.g. dance3, cheerful2)
+         → play directly
+      5. otherwise → error
+
+    NOTE: clip playback speed is controlled by the recorded JSON timeline on the
+    daemon, NOT by this handler. The face tracker delta clamp in robot_brain.py
+    still protects against the racing-back-to-face side-effect after the clip
+    finishes — that was the only bit we could fix on the LLM side.
     """
-    name = (name or "").strip().lower()
-    ALLOWED = {"happy", "sad", "curious", "think", "greet", "shake", "nod"}
-    if name not in ALLOWED:
-        return {"error": f"unknown emotion {name!r}, valid: {sorted(ALLOWED)}"}
-    return _post_daemon(f"/api/move/play/{name}")
+    n = (name or "").strip().lower()
+    if not n:
+        return {"error": "empty emotion/dance name"}
+
+    # 1. Dance library
+    if n in _DANCE_NAMES:
+        ds = _urlparse.quote(_DANCES_LIB, safe="")
+        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+
+    # 2. Generic "dance" intent
+    if n in {"dance", "dancing", "boogie", "groove", "jig"}:
+        ds = _urlparse.quote(_DANCES_LIB, safe="")
+        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/yeah_nod")
+
+    # 3. English-friendly emotion alias
+    if n in _EMOTION_ALIAS:
+        clip = _EMOTION_ALIAS[n]
+        ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
+        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{clip}")
+
+    # 4. Direct clip name pass-through (daemon validates)
+    ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
+    result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+    if isinstance(result, dict) and result.get("error"):
+        return {"error": f"unknown emotion/dance {name!r}; try: dance / happy / sad / curious / thoughtful / greet / nod / shake / surprised / scared / proud"}
+    return result
 
 
 def _tool_see_what(query: str = "", **_kwargs) -> dict:
@@ -421,8 +500,11 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
     ),
     "play_emotion": (
         _spec("play_emotion",
-              "Play an emotion animation. Choose from: happy, sad, curious, think, greet, shake, nod.",
-              {"name": {"type": "string", "description": "Emotion name."}},
+              "Play a pre-recorded animation: emotion OR dance. "
+              "Dances: dance | yeah_nod | jackson_square | dizzy_spin | groovy_sway_and_roll | side_to_side_sway | pendulum_swing | grid_snap | chicken_peck | head_tilt_roll | uh_huh_tilt | side_peekaboo. "
+              "Emotions: happy | sad | curious | thoughtful | greet | nod | shake | surprised | scared | proud | loving | confused | shy | tired | enthusiastic | grateful | bored | frustrated | angry | calm | welcome | listening. "
+              "Use 'dance' for a generic dance, or a specific dance/emotion name.",
+              {"name": {"type": "string", "description": "Animation name — 'dance' for generic dance, or a specific name from the lists above."}},
               required=["name"]),
         _tool_play_emotion,
     ),
