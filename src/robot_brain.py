@@ -1260,7 +1260,9 @@ def _ask_via_litellm(text: str) -> dict:
     return {"speech": raw, "actions": []}
 
 # S5: Optional tool calling. Enabled by env LLM_TOOLS=1 (default on).
-# Streaming path doesn't use tools; this non-streaming path does.
+# Both streaming and non-streaming paths now pass tools to the LLM. Streaming
+# handles tool_calls as accumulated SSE deltas + executes them at stream end;
+# non-streaming runs a full multi-turn tool loop (MAX_TOOL_ITERS).
 try:
     from robot_tools import get_tool_specs, parse_tool_calls, execute_tool
     _TOOLS_AVAILABLE = True
@@ -1679,6 +1681,10 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
     n_sent = 0
     in_think = False   # cross-chunk state for <think>…</think> stripper
 
+    # Tools must be included in the streaming payload — without this vLLM never
+    # learns about Reachy's capabilities and cannot emit tool_calls during the
+    # stream. The tool_call_acc accumulator below was dead code until this fix.
+    tools_spec = get_tool_specs() if LLM_TOOLS else None
     payload = {
         "model": OLLAMA_MODEL,
         "stream": True,
@@ -1695,6 +1701,8 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
             {"role": "user",   "content": text},
         ],
     }
+    if tools_spec:
+        payload["tools"] = tools_spec
     send_payload = _llm_chat_payload(payload)
     req = _urlreq.Request(
         _llm_chat_url(),
