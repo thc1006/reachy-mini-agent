@@ -81,25 +81,41 @@ def _positive_windows(cfg: WakeConfig, manifest: dict) -> np.ndarray:
     return feats
 
 
+def _load_neg_file(path: Path) -> np.ndarray:
+    """Return a memory-mapped (N, 96) frame stream.
+
+    Dtype is preserved (int16 stays int16) so the 17 GB ACAV100M file does
+    not get materialised in RAM as 34 GB of float32. Callers dequantise the
+    handful of windows they sample.
+    """
+    a = np.load(path, mmap_mode="r")
+    if a.ndim == 3 and a.shape[1:] == (FRAME_STACK, 96):
+        a = a.reshape(-1, 96)
+    if a.ndim != 2 or a.shape[1] != 96:
+        raise RuntimeError(f"unexpected neg shape in {path.name}: {a.shape}")
+    if a.dtype not in (np.int16, np.float32):
+        a = np.ascontiguousarray(a, dtype=np.float32)
+    return a
+
+
+def _dequant_window(window: np.ndarray) -> np.ndarray:
+    """Sample-time dequantise: int16 -> float32 in [-1, 1]; pass float32 through."""
+    if window.dtype == np.int16:
+        return window.astype(np.float32) / 32768.0
+    return np.ascontiguousarray(window, dtype=np.float32)
+
+
 def _negative_windows(cfg: WakeConfig, n_windows: int) -> np.ndarray:
-    """Sample 16-frame windows from precomputed per-frame neg shards."""
-    paths = sorted(cfg.neg_dir.glob("negative_features_*.npy"))
-    if not paths:
-        raise FileNotFoundError(f"no neg shards under {cfg.neg_dir}")
+    """Sample 16-frame windows from precomputed per-frame neg files."""
+    paths = [cfg.neg_dir / fn for fn in cfg.negative_files]
+    missing = [p for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"missing neg files in {cfg.neg_dir}: {[p.name for p in missing]}"
+        )
 
     rng = np.random.default_rng(cfg.train.seed)
-    pooled: list[np.ndarray] = []
-    for p in paths:
-        a = np.load(p, mmap_mode="r")
-        # accept either per-frame (N, 96) stream or pre-windowed (N, 16, 96)
-        if a.ndim == 2 and a.shape[1] == 96:
-            pooled.append(a)
-        elif a.ndim == 3 and a.shape[1:] == (FRAME_STACK, 96):
-            # already windowed — flatten back to frame stream (lose window
-            # boundaries but recover uniform sampling)
-            pooled.append(a.reshape(-1, 96))
-        else:
-            raise RuntimeError(f"unexpected neg shape in {p.name}: {a.shape}")
+    pooled = [_load_neg_file(p) for p in paths]
 
     # Sample windows lazily across all shards
     shard_sizes = [p.shape[0] for p in pooled]
@@ -115,13 +131,14 @@ def _negative_windows(cfg: WakeConfig, n_windows: int) -> np.ndarray:
         local_start = start - (cum[shard_idx - 1] if shard_idx > 0 else 0)
         shard = pooled[shard_idx]
         if local_start + FRAME_STACK <= shard.shape[0]:
-            out[i] = shard[local_start:local_start + FRAME_STACK]
+            window = shard[local_start:local_start + FRAME_STACK]
         else:
             # crossing shard boundary — wrap to next shard (rare but safe)
             head = shard[local_start:]
             need = FRAME_STACK - head.shape[0]
             nxt = pooled[(shard_idx + 1) % len(pooled)][:need]
-            out[i] = np.concatenate([head, nxt], axis=0)
+            window = np.concatenate([head, nxt], axis=0)
+        out[i] = _dequant_window(window)
     return out
 
 

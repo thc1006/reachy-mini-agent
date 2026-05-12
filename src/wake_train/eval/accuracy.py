@@ -52,18 +52,21 @@ def measure(cfg: WakeConfig) -> dict:
         out = sess.run(None, {inp_name: window[None].astype(np.float32)})[0]
         pos_scores[i] = float(out[0, 0])
 
-    # Negatives: sample windows from precomputed shards (per-frame stream)
-    neg_paths = sorted(cfg.neg_dir.glob("negative_features_*.npy"))
-    if not neg_paths:
-        raise FileNotFoundError(f"no neg shards under {cfg.neg_dir}")
-    neg_emb = np.load(neg_paths[0], mmap_mode="r")
-    if neg_emb.ndim == 3:
-        neg_emb = neg_emb.reshape(-1, 96)
+    # Negatives: sample windows from precomputed feature file(s)
+    from ..train import _load_neg_file, _dequant_window
+
+    neg_paths = [cfg.neg_dir / fn for fn in cfg.negative_files]
+    missing = [p for p in neg_paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"missing neg files in {cfg.neg_dir}: {[p.name for p in missing]}"
+        )
+    neg_emb = _load_neg_file(neg_paths[0])
     n_neg = min(20_000, neg_emb.shape[0] - FRAME_STACK)
     starts = rng.integers(0, neg_emb.shape[0] - FRAME_STACK, size=n_neg)
     neg_scores = np.zeros(n_neg, dtype=np.float32)
     for i, s in enumerate(starts):
-        window = np.asarray(neg_emb[s:s + FRAME_STACK], dtype=np.float32)[None]
+        window = _dequant_window(neg_emb[s:s + FRAME_STACK])[None]
         neg_scores[i] = float(sess.run(None, {inp_name: window})[0][0, 0])
 
     by_threshold = {}

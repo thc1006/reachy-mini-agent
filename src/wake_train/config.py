@@ -68,7 +68,7 @@ class WakeConfig:
     voices: tuple[str, ...]
     n_synth_per_voice_phrase: int
     real_recordings_dir: Path | None
-    negative_shards: int
+    negative_files: tuple[str, ...]
     augment: AugmentConfig
     train: TrainConfig
     base_dir: Path
@@ -146,7 +146,9 @@ POC_CONFIG = WakeConfig(
     n_synth_per_voice_phrase=200,   # 2 voices x 2 phrases x 200 = 800 raw,
                                     # aug expands ~3x -> ~2.4k positives
     real_recordings_dir=None,
-    negative_shards=2,              # ~3 GB
+    # POC uses the 180 MB validation corpus repurposed as training negatives;
+    # full 17 GB ACAV100M file is PROD only.
+    negative_files=("validation_set_features.npy",),
     augment=AugmentConfig(),
     train=TrainConfig(),
     base_dir=_BASE_DIR,
@@ -169,7 +171,10 @@ PROD_CONFIG = WakeConfig(
     ),
     n_synth_per_voice_phrase=125,   # 8 voices x 5 phrases x 125 = 5000 raw
     real_recordings_dir=_BASE_DIR / "_wake_probe_real",
-    negative_shards=16,             # ~24 GB
+    # PROD uses the 17 GB ACAV100M 2000-hour feature file (int16 dequant -> f32)
+    negative_files=(
+        "openwakeword_features_ACAV100M_2000_hrs_16bit.npy",
+    ),
     augment=AugmentConfig(),
     train=TrainConfig(n_steps=200_000, warmup_steps=5_000),
     base_dir=_BASE_DIR,

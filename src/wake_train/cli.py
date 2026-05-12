@@ -75,7 +75,7 @@ def cmd_augment(args: argparse.Namespace) -> int:
 
 def cmd_negatives(args: argparse.Namespace) -> int:
     cfg = cfgmod.get(args.scope)
-    neg.fetch(cfg.neg_dir, n_shards=cfg.negative_shards)
+    neg.fetch(cfg.neg_dir, filenames=cfg.negative_files)
     return 0
 
 

@@ -1,13 +1,18 @@
 """Fetch precomputed negative embeddings from openWakeWord.
 
-The upstream training recipe relies on ~30k hours of negative audio
-pre-encoded into the openWakeWord embedding space and published as a
-HuggingFace dataset (dscripka/openwakeword_features). POC pulls a 2-shard
-subset (~3 GB) so the classifier sees enough diversity to converge without
-the full 24 GB cost.
+openWakeWord publishes two negative-feature files on HuggingFace at
+``davidscripka/openwakeword_features``:
 
-This module is a thin wrapper around huggingface_hub.snapshot_download so the
-training entrypoint can be deterministic about which shards it consumed.
+  * ``validation_set_features.npy`` (180 MB) — a smaller, clean negative
+    corpus normally used to compute FAR on a held-out validation set.
+    Repurposing it for POC training keeps disk under 1 GB.
+  * ``openwakeword_features_ACAV100M_2000_hrs_16bit.npy`` (17.28 GB) — the
+    full 2000-hour training feature set, stored as int16 to save space.
+    Used by PROD; dequantise to float32 at load time.
+
+The pre-2025 multi-shard ``negative_features_*.npy`` layout this module
+originally assumed does not exist; this is the authoritative source per
+the openwakeword.com training docs.
 """
 
 from __future__ import annotations
@@ -19,9 +24,8 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-NEG_REPO_ID = "dscripka/openwakeword_features"
+NEG_REPO_ID = "davidscripka/openwakeword_features"
 NEG_REPO_TYPE = "dataset"
-NEG_FILE_PATTERN = "negative_features_*.npy"
 
 
 @dataclass(frozen=True)
@@ -34,26 +38,15 @@ class NegativeSet:
         return len(self.files)
 
 
-def fetch(target_dir: Path, n_shards: int) -> NegativeSet:
-    """Download ``n_shards`` of negative features into ``target_dir``."""
+def fetch(target_dir: Path, filenames: tuple[str, ...]) -> NegativeSet:
+    """Download each ``filenames`` entry into ``target_dir``."""
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import hf_hub_download
 
-    api = HfApi()
-    available = sorted(
-        f for f in api.list_repo_files(NEG_REPO_ID, repo_type=NEG_REPO_TYPE)
-        if f.startswith("negative_features_") and f.endswith(".npy")
-    )
-    if not available:
-        raise RuntimeError(
-            f"no negative feature shards found in {NEG_REPO_ID!r}; "
-            "openWakeWord may have changed its dataset layout"
-        )
-    chosen = available[:n_shards]
-    log.info("downloading %d/%d neg shards from %s", len(chosen), len(available), NEG_REPO_ID)
     paths: list[Path] = []
-    for name in chosen:
+    for name in filenames:
+        log.info("downloading %s from %s", name, NEG_REPO_ID)
         local = hf_hub_download(
             repo_id=NEG_REPO_ID,
             filename=name,
@@ -64,8 +57,11 @@ def fetch(target_dir: Path, n_shards: int) -> NegativeSet:
     return NegativeSet(root=target_dir, files=tuple(paths))
 
 
-def scan(target_dir: Path) -> NegativeSet:
+def scan(target_dir: Path, filenames: tuple[str, ...] | None = None) -> NegativeSet:
     """Return the negative set already cached on disk, no network."""
     target_dir = Path(target_dir)
-    paths = tuple(sorted(target_dir.glob(NEG_FILE_PATTERN)))
+    if filenames is None:
+        paths = tuple(sorted(target_dir.glob("*.npy")))
+    else:
+        paths = tuple(target_dir / f for f in filenames if (target_dir / f).exists())
     return NegativeSet(root=target_dir, files=paths)

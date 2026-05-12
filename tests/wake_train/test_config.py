@@ -21,7 +21,9 @@ def test_poc_is_smaller_than_prod():
     poc, prod = cfgmod.POC_CONFIG, cfgmod.PROD_CONFIG
     assert len(poc.voices) < len(prod.voices)
     assert len(poc.phrases) <= len(prod.phrases)
-    assert poc.negative_shards < prod.negative_shards
+    assert poc.negative_files != prod.negative_files
+    assert any("validation" in f for f in poc.negative_files)
+    assert any("ACAV100M" in f or "2000_hrs" in f for f in prod.negative_files)
     assert poc.train.n_steps < prod.train.n_steps
 
 
