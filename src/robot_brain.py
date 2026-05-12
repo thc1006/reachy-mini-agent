@@ -2077,11 +2077,16 @@ def tracking_loop(mini, stop_event: threading.Event):
                     smooth_dx, smooth_dy = 0.0, 0.0  # 重置平滑值
                     set_state(State.IDLE)
                     # 臉沒了就把頭轉回中間，不要卡在偏向的位置
+                    # ⚠️ 必用 goto_target + duration：tracking loop 用 set_target 是即時
+                    # streaming setpoint、底層 50Hz 平滑；但這裡是離散一次性 reset、若
+                    # 用 set_target(0,0) 從 ±25° 位置會瞬間衝回中、嚇人。改用 goto_target。
                     if _motion_lock.acquire(blocking=False):
                         try:
-                            mini.set_target(
+                            mini.goto_target(
                                 head=create_head_pose(pitch=0, yaw=0),
                                 body_yaw=0.0,
+                                duration=1.0,
+                                method="minjerk",
                             )
                         except Exception:
                             pass
