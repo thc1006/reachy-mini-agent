@@ -27,7 +27,10 @@ from .negatives import scan as scan_negatives
 log = logging.getLogger(__name__)
 
 
-def _collect_wavs(root: Path, source: str, allowed_slugs: set[str]) -> list[dict]:
+def _collect_wavs(root: Path, source: str, allowed_slugs: set[str],
+                  base: Path) -> list[dict]:
+    """Walk ``root`` and emit one record per wav, with ``wav`` stored relative
+    to ``base`` so callers can join with cfg.data_dir consistently."""
     if not root.exists():
         return []
     out: list[dict] = []
@@ -40,7 +43,7 @@ def _collect_wavs(root: Path, source: str, allowed_slugs: set[str]) -> list[dict
         if slug not in allowed_slugs:
             continue
         out.append({
-            "wav": str(wav.relative_to(root.parents[1])),
+            "wav": str(wav.relative_to(base)),
             "slug": slug,
             "source": source,
         })
@@ -49,11 +52,18 @@ def _collect_wavs(root: Path, source: str, allowed_slugs: set[str]) -> list[dict
 
 def build(cfg: WakeConfig) -> Path:
     allowed = set(cfg.phrases)
+    base = cfg.data_dir
     positives: list[dict] = []
-    positives += _collect_wavs(cfg.synth_dir, "synth", allowed)
-    positives += _collect_wavs(cfg.aug_dir, "aug", allowed)
+    positives += _collect_wavs(cfg.synth_dir, "synth", allowed, base)
+    positives += _collect_wavs(cfg.aug_dir, "aug", allowed, base)
     if cfg.real_recordings_dir is not None:
-        positives += _collect_wavs(cfg.real_recordings_dir, "real", allowed)
+        # real recordings live OUTSIDE data_dir (under repo root) — keep
+        # the absolute path so the train loader can resolve it without
+        # needing it to be under cfg.data_dir.
+        for rec in _collect_wavs(cfg.real_recordings_dir, "real", allowed,
+                                  cfg.real_recordings_dir):
+            rec["wav"] = str(cfg.real_recordings_dir / rec["wav"])
+            positives.append(rec)
 
     neg = scan_negatives(cfg.neg_dir)
     negatives = [{"path": str(p.relative_to(cfg.data_dir))} for p in neg.files]
