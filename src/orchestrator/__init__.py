@@ -9,11 +9,23 @@ the real STT/LLM/TTS is a follow-up PR.
 See ``docs/multitask-arch.md`` for the design.
 """
 
-from .dialog import Dialog, DialogConfig, DialogStats
+try:
+    from .dialog import Dialog, DialogConfig, DialogStats
+    from .motion import Motion, MotionConfig, MotionStats
+    from .perception import Perception, PerceptionConfig, PerceptionStats
+    from .runner import ConcurrentRunner, RunResult, SerialRunner, TurnTiming
+    _HAS_ACTORS = True
+except ImportError:
+    # On the production deploy host (s1) the bench-only optional deps
+    # (e.g. matplotlib if we add it later) may be missing, but the
+    # event bus + events should still be importable so robot_brain.py
+    # can publish without the actor stubs being available.
+    Dialog = DialogConfig = DialogStats = None  # type: ignore
+    Motion = MotionConfig = MotionStats = None  # type: ignore
+    Perception = PerceptionConfig = PerceptionStats = None  # type: ignore
+    ConcurrentRunner = RunResult = SerialRunner = TurnTiming = None  # type: ignore
+    _HAS_ACTORS = False
 from .event_bus import EventBus, DropPolicy
-from .motion import Motion, MotionConfig, MotionStats
-from .perception import Perception, PerceptionConfig, PerceptionStats
-from .runner import ConcurrentRunner, RunResult, SerialRunner, TurnTiming
 from .events import (
     Event,
     FaceSeen,
