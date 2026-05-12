@@ -664,11 +664,8 @@ async def _fetch_hagen_tts(text: str):
     normalized = _normalize_for_tts_hagen(text)
     if normalized != text:
         print(f"  [HaGen normalize] {text!r} -> {normalized!r}")
-    # Short text needs padding (RCA: GPT EOS bias on training chunk-length prior)
-    padded = _pad_for_hagen(normalized)
-    if padded != normalized:
-        print(f"  [HaGen pad] {normalized!r} -> {padded!r}")
-    normalized = padded
+    # Cache key uses NORMALIZED text (pre-padding) — keeps cache stable across
+    # randomized padding choices. Same input → same cache file → no server hit.
     cache_key = hashlib.md5(("hagen|" + normalized).encode("utf-8")).hexdigest()
     cache_path = TTS_CACHE_DIR / f"hagen_{cache_key}.wav"
     if cache_path.exists():
@@ -684,6 +681,12 @@ async def _fetch_hagen_tts(text: str):
             return data, sr
         except Exception as e:
             print(f"  [TTS HaGen cache read fail] {e}")
+    # Padding happens only on cache miss (avoid wasting compute when audio
+    # already cached). Padding output IS used in the HTTP request but NOT in
+    # the cache key — see comment above.
+    padded = _pad_for_hagen(normalized)
+    if padded != normalized:
+        print(f"  [HaGen pad] {normalized!r} -> {padded!r}")
     try:
         import aiohttp
         t0 = time.perf_counter()
@@ -692,14 +695,14 @@ async def _fetch_hagen_tts(text: str):
         ) as sess:
             async with sess.post(
                 HAGEN_TTS_URL,
-                json={"text": normalized},
+                json={"text": padded},
             ) as resp:
                 if resp.status != 200:
                     body = (await resp.read())[:200]
                     print(f"  [TTS HaGen 失敗] status={resp.status} body={body!r}")
                     return None
                 body = await resp.read()
-        print(f"  [TTS HaGen] {(time.perf_counter()-t0)*1000:.0f}ms <{len(normalized)} chars, {len(body)}B>")
+        print(f"  [TTS HaGen] {(time.perf_counter()-t0)*1000:.0f}ms <{len(padded)} chars, {len(body)}B>")
         data, sr = sf.read(io.BytesIO(body), dtype="float32")
     except Exception as e:
         print(f"  [TTS HaGen 失敗] {type(e).__name__}: {e}，fallback")
