@@ -771,6 +771,8 @@ async def _stream_tts(text: str, mini) -> None:
     if gain != 1.0:
         audio = np.clip(audio * gain, -1.0, 1.0)
     duration_s = len(audio) / SAMPLE_RATE
+    # Gate the mic before audio leaves the speaker. STT loops check this flag.
+    _speaking_event.set()
     mini.media.start_playing()
     try:
         for i in range(0, len(audio), CHUNK_SAMPLES):
@@ -788,6 +790,9 @@ async def _stream_tts(text: str, mini) -> None:
             mini.media.stop_playing()
         except Exception:
             pass
+        # Hold mic-gate a bit longer so speaker tail + USB buffer doesn't echo.
+        time.sleep(TTS_TAIL_DRAIN_S)
+        _speaking_event.clear()
 
 def speak(mini, text: str):
     t0 = time.perf_counter()
@@ -804,10 +809,32 @@ def speak(mini, text: str):
     except Exception as e:
         print(f"  [TTS 錯誤] {e}")
 
+# ── Echo-loop 防護: TTS 期間 mic gating ─────────────────────────────────
+# Bug fixed: 之前 TTS 播放時 mic 也在錄、speaker → mic 環路被 VAD 觸發 →
+# STT 轉錄出機器人自己剛說的話 → LLM 收到當新使用者輸入 → 自言自語死循環。
+# Fix: TTS 進入 _stream_tts 立刻 set(), 播完 + drain 緩衝後 clear().
+# STT 錄音前 wait_clear() + 排乾 stale 樣本。
+_speaking_event = threading.Event()
+TTS_TAIL_DRAIN_S = float(os.getenv("TTS_TAIL_DRAIN_S", "0.4"))  # 播放停止後等多久 mic 再開
+
+
+def _wait_not_speaking(max_wait_s: float = 30.0) -> None:
+    """Block until TTS finished or timeout. Safety timeout prevents deadlock
+    if some path forgot to clear _speaking_event."""
+    t0 = time.time()
+    while _speaking_event.is_set():
+        if time.time() - t0 > max_wait_s:
+            print(f"  [mic gate] WARN: _speaking_event stuck set > {max_wait_s}s, forcing clear")
+            _speaking_event.clear()
+            break
+        time.sleep(0.02)
+
+
 # ── 麥克風錄音（支援 robot WebRTC mic 或 PC pyaudio fallback）────────────────
 def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
     """從 Reachy Mini 的 WebRTC audio stream 錄音"""
-    # 先排乾之前累積的 stale buffer（避免聽到舊聲音）
+    _wait_not_speaking()
+    # 先排乾之前累積的 stale buffer（避免聽到舊聲音 / TTS 殘響）
     drained = 0
     while mini.media.get_audio_sample() is not None and drained < 200:
         drained += 1
@@ -839,6 +866,7 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
     return np.concatenate(chunks) if has_speech else None
 
 def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
+    _wait_not_speaking()
     pa = pyaudio.PyAudio()
     stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
                      input=True, frames_per_buffer=CHUNK_SAMPLES)
