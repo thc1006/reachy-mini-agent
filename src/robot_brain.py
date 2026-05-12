@@ -60,13 +60,19 @@ try:
         SceneDescribed as _OrchSceneDescribed,
     )
     _HAS_ORCHESTRATOR = True
-except Exception as _orch_imp_err:    # pragma: no cover — older deploy host
+except (ImportError, ModuleNotFoundError) as _orch_imp_err:    # pragma: no cover
+    # Narrow exception list on purpose: orchestrator/__init__.py already
+    # swallows actor-side failures broadly, so the only thing that
+    # should reach us here is the package being absent on this deploy
+    # host. A genuine bug in event_bus.py / events.py should surface
+    # as a SyntaxError / RuntimeError and crash robot_brain — silent
+    # fallback would hide that.
     _OrchEventBus = None
     _OrchFaceLost = None
     _OrchFaceSeen = None
     _OrchSceneDescribed = None
     _HAS_ORCHESTRATOR = False
-    print(f"  [bus] orchestrator import failed, legacy-only: {_orch_imp_err}",
+    print(f"  [bus] orchestrator package not present, legacy-only: {_orch_imp_err}",
           flush=True)
 
 _bus = None
@@ -83,7 +89,7 @@ def _get_bus():
     without it, a single start() failure would cause every subsequent
     publish call to retry construction + spam logs + add latency.
     """
-    global _bus
+    global _bus, _bus_disabled
     if _bus is not None:
         return _bus
     if not _HAS_ORCHESTRATOR or _bus_disabled:
@@ -100,7 +106,7 @@ def _get_bus():
         except Exception as e:
             print(f"  [bus] start failed, disabling future attempts: {e}",
                   flush=True)
-            globals()["_bus_disabled"] = True
+            _bus_disabled = True
     return _bus
 
 

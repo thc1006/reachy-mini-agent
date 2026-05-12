@@ -93,7 +93,6 @@ class ConcurrentRunner:
         self._final_event = None
         self._first_audio_at: Optional[float] = None
         self._last_audio_at: Optional[float] = None
-        self._t_user_done: Optional[float] = None
 
         self.bus.subscribe(
             DialogSpeechFinal.topic,

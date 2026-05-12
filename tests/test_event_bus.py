@@ -98,7 +98,14 @@ class TestEventBusBasics:
         finally:
             bus.stop()
 
-    def test_multi_subscriber_each_receive_own_copy(self):
+    def test_multi_subscriber_each_sees_event_via_independent_queue(self):
+        """Each subscriber gets its own ``queue.Queue``, so a slow
+        consumer cannot back up a fast one. The *event object* itself
+        is shared by reference across subscribers — handlers MUST
+        treat events as read-only; mutating ``ev.text`` would be seen
+        by every other subscriber. (We do not enforce immutability with
+        ``frozen=True`` dataclasses because ``publish()`` itself sets
+        ``ev.ts`` when zero.)"""
         bus = EventBus()
         a, b = [], []
         bus.subscribe(_T.topic, _collect(a), name="sub_a")
@@ -110,6 +117,9 @@ class TestEventBusBasics:
             assert _wait_until(lambda: len(a) == 5 and len(b) == 5)
             assert [e.n for e in a] == [0, 1, 2, 3, 4]
             assert [e.n for e in b] == [0, 1, 2, 3, 4]
+            # Document the shared-reference contract — both subscribers
+            # see the same Python object for each published event.
+            assert a[0] is b[0]
         finally:
             bus.stop()
 
@@ -209,6 +219,29 @@ class TestEventBusLifecycle:
         bus.subscribe(_T.topic, lambda e: None, name="x")
         with pytest.raises(RuntimeError):
             bus.publish(_T(n=1))
+
+    def test_restart_after_stop_resumes_normal_publish(self):
+        """PR #1 review #9: stop() sets _stopping=True; start() must
+        reset it so a restarted bus actually delivers events instead of
+        silently dropping every publish through the post-stop short-
+        circuit."""
+        bus = EventBus()
+        out: list = []
+        bus.subscribe(_T.topic, _collect(out), name="restart")
+        bus.start()
+        bus.publish(_T(n=1))
+        assert _wait_until(lambda: len(out) == 1)
+        bus.stop()
+
+        # Restart: same subs, same bus instance. Without the start()
+        # reset of _stopping, the next publish would be a silent no-op.
+        bus.start()
+        try:
+            bus.publish(_T(n=2))
+            assert _wait_until(lambda: len(out) == 2)
+            assert [e.n for e in out] == [1, 2]
+        finally:
+            bus.stop()
 
     def test_publish_during_stop_is_silent_noop(self):
         """PR #1 review #2: events published after stop() started must not
