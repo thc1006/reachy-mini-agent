@@ -119,7 +119,13 @@ assert len(TESTS) == 20
 TOOLS = get_tool_specs()
 
 
-def query(sys_prompt: str, user_msg: str) -> dict:
+def query(sys_prompt: str, user_msg: str, stream: bool = False) -> dict:
+    """Hit vLLM and return a non-stream-shaped dict regardless of mode.
+
+    Stream mode: parse SSE deltas, accumulate tool_calls + content, then
+    synthesize a non-stream-shape response so the rest of the pipeline is
+    mode-agnostic. Mirrors the accumulator pattern in robot_brain.py:1722.
+    """
     payload = {
         "model":       MODEL,
         "messages": [
@@ -131,7 +137,7 @@ def query(sys_prompt: str, user_msg: str) -> dict:
         "temperature": 0.75,
         "top_p":       0.92,
         "max_tokens":  200,
-        "stream":      False,
+        "stream":      stream,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     req = urllib.request.Request(
@@ -140,10 +146,52 @@ def query(sys_prompt: str, user_msg: str) -> dict:
         headers={"Content-Type": "application/json"},
     )
     t = time.perf_counter()
+    if not stream:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        data["_wall_ms"] = (time.perf_counter() - t) * 1000
+        return data
+
+    # Streaming: parse SSE, accumulate tool_calls + content
+    tool_acc: dict[int, dict] = {}
+    content_buf = []
     with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    data["_wall_ms"] = (time.perf_counter() - t) * 1000
-    return data
+        for raw in resp:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(b"data: "):
+                line = line[6:]
+            if line == b"[DONE]":
+                break
+            try:
+                obj = json.loads(line.decode("utf-8"))
+            except Exception:
+                continue
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            if delta.get("content"):
+                content_buf.append(delta["content"])
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = tool_acc.setdefault(idx, {"function": {"name": "", "arguments": ""}})
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
+
+    return {
+        "_wall_ms": (time.perf_counter() - t) * 1000,
+        "choices": [{
+            "message": {
+                "content":    "".join(content_buf),
+                "tool_calls": [tool_acc[i] for i in sorted(tool_acc.keys())],
+            },
+        }],
+    }
 
 
 def extract(resp: dict) -> tuple[list[str], str]:
@@ -162,18 +210,14 @@ def extract(resp: dict) -> tuple[list[str], str]:
     return names, content
 
 
-def run_condition(label: str, sys_prompt: str) -> dict:
-    print(f"\n{'='*78}\n  {label}\n{'='*78}")
-    rows = []
-    n_correct = 0
-    n_fired = 0
-    n_fp = 0
-    n_pos = sum(1 for _, e, _ in TESTS if e is not None)
-    n_neg = sum(1 for _, e, _ in TESTS if e is None)
+def run_single(sys_prompt: str, stream: bool) -> dict:
+    """One pass over all TESTS. Returns aggregate counts + per-prompt detail."""
+    n_correct = n_fired = n_fp = 0
     total_ms = 0
+    fail_detail = []
     for user, expected, category in TESTS:
         try:
-            resp = query(sys_prompt, user)
+            resp = query(sys_prompt, user, stream=stream)
             names, content = extract(resp)
             total_ms += resp.get("_wall_ms", 0)
             fired = bool(names)
@@ -189,34 +233,99 @@ def run_condition(label: str, sys_prompt: str) -> dict:
                 n_correct += 1
             if fired:
                 n_fired += 1
-            rows.append((category, user, expected, names, content[:60], ok))
+            if not ok:
+                fail_detail.append((category, user, expected, names, content[:80]))
         except Exception as e:
-            rows.append((category, user, expected, [f"ERR:{type(e).__name__}"], str(e)[:60], False))
+            fail_detail.append((category, user, expected, [f"ERR:{type(e).__name__}"], str(e)[:80]))
+    return {
+        "correct": n_correct, "fired": n_fired, "fp": n_fp,
+        "avg_ms": total_ms / len(TESTS),
+        "fails": fail_detail,
+    }
 
-    # Print table
-    for cat, user, expected, got, content, ok in rows:
-        mark = "✓" if ok else "✗"
-        exp = expected or "(none)"
-        got_s = ",".join(got) if got else "(no tool)"
-        print(f"  {mark} [{cat:11s}] {user[:30]:30s} exp={exp:15s} got={got_s:25s}  | {content!r}")
 
-    print(f"\n  CORRECT:        {n_correct}/20")
-    print(f"  TOOL_FIRED:     {n_fired}/20")
-    print(f"  FALSE_POSITIVE: {n_fp}/{n_neg}")
-    print(f"  AVG LATENCY:    {total_ms/20:.0f}ms")
-    return {"correct": n_correct, "fired": n_fired, "fp": n_fp, "rows": rows}
+def run_condition(label: str, sys_prompt: str, stream: bool, n_runs: int) -> dict:
+    print(f"\n{'='*78}\n  {label}  (stream={stream}, N={n_runs})\n{'='*78}")
+    runs = []
+    for i in range(n_runs):
+        t = time.perf_counter()
+        r = run_single(sys_prompt, stream)
+        dt = time.perf_counter() - t
+        print(f"  run {i+1}/{n_runs}: correct={r['correct']:>3}/20  "
+              f"fired={r['fired']:>3}/20  fp={r['fp']}/{sum(1 for _,e,_ in TESTS if e is None)}  "
+              f"avg_lat={r['avg_ms']:.0f}ms  wall={dt:.1f}s")
+        runs.append(r)
+    # Aggregate
+    def stats(key):
+        vals = [r[key] for r in runs]
+        m = sum(vals) / len(vals)
+        if len(vals) > 1:
+            v = sum((x - m) ** 2 for x in vals) / (len(vals) - 1)
+            sd = v ** 0.5
+        else:
+            sd = 0.0
+        return m, sd, vals
+    c_m, c_sd, c_v = stats("correct")
+    f_m, f_sd, f_v = stats("fired")
+    p_m, p_sd, p_v = stats("fp")
+    l_m, _, _ = stats("avg_ms")
+    print(f"\n  AGGREGATE (N={n_runs}):")
+    print(f"    correct:        mean={c_m:.1f}  std={c_sd:.2f}  vals={c_v}")
+    print(f"    tool_fired:     mean={f_m:.1f}  std={f_sd:.2f}  vals={f_v}")
+    print(f"    false_positive: mean={p_m:.1f}  std={p_sd:.2f}  vals={p_v}")
+    print(f"    avg_latency:    {l_m:.0f}ms")
+    # Show consolidated failure modes
+    fail_freq = {}
+    for r in runs:
+        for f in r["fails"]:
+            key = (f[0], f[1], f[2])
+            fail_freq[key] = fail_freq.get(key, 0) + 1
+    print(f"\n  RECURRING FAILURES (≥2 runs):")
+    for (cat, user, exp), cnt in sorted(fail_freq.items(), key=lambda kv: -kv[1]):
+        if cnt >= 2:
+            print(f"    [{cnt}/{n_runs}] [{cat}] {user[:35]:35s} exp={exp}")
+    return {
+        "correct_mean": c_m, "correct_std": c_sd,
+        "fired_mean":   f_m, "fired_std":   f_sd,
+        "fp_mean":      p_m, "fp_std":      p_sd,
+        "latency_ms":   l_m,
+        "runs": runs,
+    }
 
 
 def main():
+    N_RUNS = 3
     print(f"Tools loaded: {len(TOOLS)}  ({[t['function']['name'] for t in TOOLS]})")
     print(f"vLLM:         {VLLM_URL}  model={MODEL}")
-    old = run_condition("OLD prompt (master)", OLD_PROMPT)
-    new = run_condition("NEW prompt (B3)",     NEW_PROMPT)
-    print(f"\n{'='*78}\n  DELTA")
-    print(f"{'='*78}")
-    print(f"  correct:        {old['correct']:>3} → {new['correct']:>3}   (Δ {new['correct']-old['correct']:+d})")
-    print(f"  tool_fired:     {old['fired']:>3} → {new['fired']:>3}   (Δ {new['fired']-old['fired']:+d})")
-    print(f"  false_positive: {old['fp']:>3} → {new['fp']:>3}   (Δ {new['fp']-old['fp']:+d})")
+    print(f"Tests:        {len(TESTS)} prompts × 4 conditions × N={N_RUNS} repeats = {len(TESTS) * 4 * N_RUNS} evals")
+
+    cells = {}
+    for prompt_label, prompt_text in [("OLD", OLD_PROMPT), ("NEW", NEW_PROMPT)]:
+        for stream in [False, True]:
+            mode = "stream" if stream else "non-stream"
+            cell_label = f"{prompt_label} prompt / {mode}"
+            cells[(prompt_label, mode)] = run_condition(cell_label, prompt_text, stream, N_RUNS)
+
+    print(f"\n{'='*78}\n  CROSS-CONDITION SUMMARY (mean ± std over N={N_RUNS})\n{'='*78}")
+    print(f"  {'condition':30s}  {'correct':14s}  {'fired':14s}  {'FP':12s}  latency")
+    for (p, m), r in cells.items():
+        print(f"  {p:>3}/{m:<12s}              "
+              f"{r['correct_mean']:5.1f} ±{r['correct_std']:.2f}    "
+              f"{r['fired_mean']:5.1f} ±{r['fired_std']:.2f}    "
+              f"{r['fp_mean']:4.1f} ±{r['fp_std']:.2f}   "
+              f"{r['latency_ms']:.0f}ms")
+
+    # Key deltas
+    print(f"\n{'='*78}\n  KEY DELTAS\n{'='*78}")
+    on = cells[("OLD", "non-stream")]
+    os = cells[("OLD", "stream")]
+    nn = cells[("NEW", "non-stream")]
+    ns = cells[("NEW", "stream")]
+    print(f"  Prompt effect (non-stream):  OLD {on['correct_mean']:.1f} → NEW {nn['correct_mean']:.1f}  (Δ {nn['correct_mean']-on['correct_mean']:+.1f})")
+    print(f"  Prompt effect (stream):      OLD {os['correct_mean']:.1f} → NEW {ns['correct_mean']:.1f}  (Δ {ns['correct_mean']-os['correct_mean']:+.1f})")
+    print(f"  Stream effect (OLD):  ns {on['correct_mean']:.1f} → s {os['correct_mean']:.1f}  (Δ {os['correct_mean']-on['correct_mean']:+.1f})")
+    print(f"  Stream effect (NEW):  ns {nn['correct_mean']:.1f} → s {ns['correct_mean']:.1f}  (Δ {ns['correct_mean']-nn['correct_mean']:+.1f})")
+    print(f"  Stream fire rate (NEW): {ns['fired_mean']:.1f}/20 — confirms H1 (streaming tools fix) actually works if > 0")
 
 
 if __name__ == "__main__":
