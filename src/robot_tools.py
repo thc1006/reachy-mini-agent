@@ -273,18 +273,55 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
 
 
 import urllib.parse as _urlparse
+import threading as _threading
 
 _DANCES_LIB   = "pollen-robotics/reachy-mini-dances-library"
 _EMOTIONS_LIB = "pollen-robotics/reachy-mini-emotions-library"
 
-# 19 dance moves verified on daemon list endpoint (2026-05-13).
-_DANCE_NAMES = {
-    "yeah_nod", "chicken_peck", "chin_lead", "dizzy_spin", "grid_snap",
-    "groovy_sway_and_roll", "head_tilt_roll", "interwoven_spirals",
-    "jackson_square", "neck_recoil", "pendulum_swing", "polyrhythm_combo",
-    "sharp_side_tilt", "side_glance_flick", "side_peekaboo",
-    "side_to_side_sway", "simple_nod", "stumble_and_recover", "uh_huh_tilt",
+# Dynamic discovery — query daemon's list endpoint at first use, cache result.
+# This way the catalog auto-syncs with whatever pollen-robotics publishes and
+# whatever extra datasets the user installs on the daemon. No hardcoded names.
+#
+# Fallback set is a minimal known-good list in case the daemon is unreachable
+# at module load time (then call retries on next invocation).
+_DANCE_NAMES_FALLBACK = {
+    "yeah_nod", "simple_nod", "side_to_side_sway", "groovy_sway_and_roll",
+    "jackson_square", "dizzy_spin", "pendulum_swing", "chicken_peck",
 }
+_dataset_cache: dict[str, set[str]] = {}
+_dataset_cache_lock = _threading.Lock()
+
+
+def _fetch_dataset_moves(dataset_full_name: str) -> set[str]:
+    """Return the set of move names available in ``dataset_full_name`` on the
+    daemon. Cached after first successful call. Empty set on failure."""
+    with _dataset_cache_lock:
+        cached = _dataset_cache.get(dataset_full_name)
+    if cached is not None:
+        return cached
+    encoded = _urlparse.quote(dataset_full_name, safe="")
+    url = f"{DAEMON_BASE}/api/move/recorded-move-datasets/list/{encoded}"
+    try:
+        req = _urlreq.Request(url)
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, list):
+            result = set(data)
+            with _dataset_cache_lock:
+                _dataset_cache[dataset_full_name] = result
+            return result
+    except Exception:
+        pass
+    return set()
+
+
+def _get_dance_names() -> set[str]:
+    discovered = _fetch_dataset_moves(_DANCES_LIB)
+    return discovered if discovered else _DANCE_NAMES_FALLBACK
+
+
+def _get_emotion_clip_names() -> set[str]:
+    return _fetch_dataset_moves(_EMOTIONS_LIB)
 
 # LLM-friendly English names → emotions-library clip names. 80+ clips
 # available; this maps the common English emotion words an LLM would emit.
@@ -343,28 +380,39 @@ def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
     if not n:
         return {"error": "empty emotion/dance name"}
 
-    # 1. Dance library
-    if n in _DANCE_NAMES:
+    dances   = _get_dance_names()
+    emotions = _get_emotion_clip_names()
+
+    # 1. Direct dance-library hit (dynamic — covers any name pollen publishes)
+    if n in dances:
         ds = _urlparse.quote(_DANCES_LIB, safe="")
         return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
 
-    # 2. Generic "dance" intent
+    # 2. Generic "dance" intent → first dance in library (alphabetical, deterministic)
     if n in {"dance", "dancing", "boogie", "groove", "jig"}:
+        pick = "yeah_nod" if "yeah_nod" in dances else (sorted(dances)[0] if dances else "yeah_nod")
         ds = _urlparse.quote(_DANCES_LIB, safe="")
-        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/yeah_nod")
+        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{pick}")
 
-    # 3. English-friendly emotion alias
+    # 3. Direct emotion-library hit (dynamic — covers ALL clips, e.g. dance3,
+    #    enthusiastic2, proud3, yes_sad1, oops2, understanding2 — beyond aliases)
+    if n in emotions:
+        ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
+        return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+
+    # 4. English-friendly alias (LLM emits "happy" → cheerful1, etc.)
     if n in _EMOTION_ALIAS:
         clip = _EMOTION_ALIAS[n]
         ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
         return _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{clip}")
 
-    # 4. Direct clip name pass-through (daemon validates)
-    ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
-    result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
-    if isinstance(result, dict) and result.get("error"):
-        return {"error": f"unknown emotion/dance {name!r}; try: dance / happy / sad / curious / thoughtful / greet / nod / shake / surprised / scared / proud"}
-    return result
+    # 5. Unknown — hint at available categories without dumping 100 names
+    hint_dances = sorted(list(dances))[:6] if dances else []
+    return {"error": f"unknown name {name!r}",
+            "hint_dances": hint_dances,
+            "hint_aliases": ["happy", "sad", "curious", "thoughtful", "greet",
+                             "nod", "shake", "surprised", "scared", "proud",
+                             "loving", "tired", "confused", "calm"]}
 
 
 def _tool_see_what(query: str = "", **_kwargs) -> dict:
