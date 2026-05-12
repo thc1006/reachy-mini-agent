@@ -46,6 +46,61 @@ from mediapipe.tasks.python.vision import (
 # 用所有實體核心跑 OpenCV（i5-11320H = 4C/8T）
 cv2.setNumThreads(max(1, (os.cpu_count() or 8)))
 
+# ── B2 multitask orchestrator scaffold (additive) ────────────────────────────
+# Each migration step in docs/multitask-arch.md §6 wraps one legacy publish
+# site to also emit on this bus. Subscribers are added piecewise; until then
+# events are observability-only and the legacy global-variable/lock plumbing
+# stays as-is. If the orchestrator package is missing (older deploy host
+# without src/orchestrator/) the bus stays None and everything falls back.
+try:
+    from orchestrator import EventBus as _OrchEventBus
+    from orchestrator.events import (
+        FaceLost as _OrchFaceLost,
+        FaceSeen as _OrchFaceSeen,
+        SceneDescribed as _OrchSceneDescribed,
+    )
+    _HAS_ORCHESTRATOR = True
+except Exception as _orch_imp_err:    # pragma: no cover — older deploy host
+    _OrchEventBus = None
+    _OrchFaceLost = None
+    _OrchFaceSeen = None
+    _OrchSceneDescribed = None
+    _HAS_ORCHESTRATOR = False
+    print(f"  [bus] orchestrator import failed, legacy-only: {_orch_imp_err}",
+          flush=True)
+
+_bus = None
+_bus_lock = threading.Lock()
+
+
+def _get_bus():
+    """Lazy singleton EventBus. Returns None if the orchestrator package
+    is unavailable. Safe to call from any thread."""
+    global _bus
+    if _bus is not None or not _HAS_ORCHESTRATOR:
+        return _bus
+    with _bus_lock:
+        if _bus is not None:
+            return _bus
+        try:
+            b = _OrchEventBus()
+            b.start()
+            _bus = b
+        except Exception as e:
+            print(f"  [bus] start failed: {e}", flush=True)
+    return _bus
+
+
+def _bus_publish(event) -> None:
+    """Best-effort publish — never raises into the caller's path."""
+    bus = _get_bus()
+    if bus is None or event is None:
+        return
+    try:
+        bus.publish(event)
+    except Exception as e:
+        print(f"  [bus publish err] {e}", flush=True)
+
 # ── utf-8 輸出 ────────────────────────────────────────────────────────────────
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
@@ -357,6 +412,10 @@ def vision_worker(stop_event: threading.Event):
                     _scene_desc = desc
                     _scene_desc_t = time.time()
                 print(f"  [視覺] {dur_ms:.0f}ms: {desc[:90]}", flush=True)
+                # B2 step 2: additive bus publish. Legacy _scene_desc /
+                # _current_scene() still works unchanged.
+                if _OrchSceneDescribed is not None:
+                    _bus_publish(_OrchSceneDescribed(text=desc))
         except Exception as e:
             print(f"  [視覺錯誤] {e}", flush=True)
         finally:
