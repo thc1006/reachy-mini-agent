@@ -111,70 +111,72 @@ def convolve_rir(audio: np.ndarray, rir: np.ndarray) -> np.ndarray:
 
 @dataclass
 class AugPipeline:
+    """Stateless pipeline — every call to apply() builds a fresh RNG from the
+    given ``clip_seed`` (or ``cfg.seed`` if omitted). The old design held an
+    instance RNG and consumed state across calls, which made augmentation
+    order-dependent: inserting a new clip into the synth dir would shift the
+    RNG state for every clip that sorted after it, silently changing all
+    prior outputs.
+    """
+
     cfg: AugmentConfig
     sample_rate: int = 16_000
     background_pool: list[Path] | None = None
     rir_pool: list[Path] | None = None
 
-    def __post_init__(self) -> None:
-        self._rng = np.random.default_rng(self.cfg.seed)
-
-    def _maybe(self, prob: float) -> bool:
-        return bool(self._rng.random() < prob)
-
-    def _rand_range(self, lo: float, hi: float) -> float:
-        return float(self._rng.uniform(lo, hi))
-
-    def _load_random(self, pool: list[Path] | None) -> np.ndarray:
+    def _load_random(self, pool: list[Path] | None, rng: np.random.Generator) -> np.ndarray:
         if not pool:
             return np.zeros(0, dtype=np.float32)
-        import soundfile as sf  # lazy import; only when pool present
-        path = pool[int(self._rng.integers(0, len(pool)))]
+        import soundfile as sf  # lazy; only when pool present
+        path = pool[int(rng.integers(0, len(pool)))]
         wav, sr = sf.read(str(path), dtype="float32", always_2d=False)
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
         if sr != self.sample_rate:
-            # cheap linear resample
-            ratio = self.sample_rate / sr
-            new_len = int(round(wav.size * ratio))
-            x = np.linspace(0.0, wav.size - 1, new_len, dtype=np.float64)
-            idx0 = np.floor(x).astype(np.int64)
-            idx1 = np.clip(idx0 + 1, 0, wav.size - 1)
-            frac = (x - idx0).astype(np.float32)
-            wav = ((1.0 - frac) * wav[idx0] + frac * wav[idx1]).astype(np.float32)
+            # Anti-aliased polyphase resample (was: naive linear interp).
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(self.sample_rate, sr)
+            wav = resample_poly(wav, self.sample_rate // g, sr // g).astype(np.float32)
         return wav
 
-    def apply(self, audio: np.ndarray) -> np.ndarray:
-        if not self.cfg.enable:
+    def apply(self, audio: np.ndarray, clip_seed: int | None = None) -> np.ndarray:
+        cfg = self.cfg
+        if not cfg.enable:
             return audio.astype(np.float32, copy=False)
+
+        seed = clip_seed if clip_seed is not None else cfg.seed
+        rng = np.random.default_rng(seed)
+
+        def maybe(p: float) -> bool:
+            return bool(rng.random() < p)
+
+        def rrange(lo: float, hi: float) -> float:
+            return float(rng.uniform(lo, hi))
 
         out = audio.astype(np.float32, copy=True)
 
-        if self._maybe(self.cfg.pitch_prob):
-            st = self._rand_range(*self.cfg.pitch_semitones_range)
-            out = pitch_shift_resample(out, st)
+        if maybe(cfg.pitch_prob):
+            out = pitch_shift_resample(out, rrange(*cfg.pitch_semitones_range))
 
-        if self._maybe(self.cfg.time_shift_prob):
-            ms = self._rand_range(*self.cfg.time_shift_ms_range)
+        if maybe(cfg.time_shift_prob):
+            ms = rrange(*cfg.time_shift_ms_range)
             out = time_shift(out, int(round(ms * self.sample_rate / 1000.0)))
 
-        if self._maybe(self.cfg.rir_prob):
-            rir = self._load_random(self.rir_pool)
+        if maybe(cfg.rir_prob):
+            rir = self._load_random(self.rir_pool, rng)
             if rir.size > 0:
                 out = convolve_rir(out, rir)
 
-        if self._maybe(self.cfg.background_prob):
-            bg = self._load_random(self.background_pool)
+        if maybe(cfg.background_prob):
+            bg = self._load_random(self.background_pool, rng)
             if bg.size > 0:
-                snr = self._rand_range(*self.cfg.background_snr_db_range)
-                out = mix_at_snr(out, bg, snr)
+                out = mix_at_snr(out, bg, rrange(*cfg.background_snr_db_range))
 
-        if self._maybe(self.cfg.noise_prob):
-            snr = self._rand_range(*self.cfg.noise_snr_db_range)
-            out = add_white_noise(out, snr, self._rng)
+        if maybe(cfg.noise_prob):
+            out = add_white_noise(out, rrange(*cfg.noise_snr_db_range), rng)
 
-        if self._maybe(self.cfg.gain_prob):
-            db = self._rand_range(*self.cfg.gain_db_range)
-            out = random_gain(out, db)
+        if maybe(cfg.gain_prob):
+            out = random_gain(out, rrange(*cfg.gain_db_range))
 
         return out

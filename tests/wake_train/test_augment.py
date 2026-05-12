@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
+
+# CI's minimal env (.github/workflows/ci.yml installs only ruff + pytest) has
+# no numpy. Skip this whole file cleanly there instead of failing collection.
+np = pytest.importorskip("numpy")
 
 from wake_train import augment
 from wake_train.config import AugmentConfig
@@ -76,6 +79,35 @@ def test_pipeline_deterministic_with_seed(tone):
     out1 = p1.apply(tone)
     out2 = p2.apply(tone)
     np.testing.assert_array_equal(out1, out2)
+
+
+def test_pipeline_clip_seed_overrides_cfg_seed(tone):
+    cfg = AugmentConfig(seed=99)
+    p = augment.AugPipeline(cfg)
+    # Same clip_seed -> identical output regardless of cfg.seed
+    np.testing.assert_array_equal(
+        p.apply(tone, clip_seed=42),
+        p.apply(tone, clip_seed=42),
+    )
+    # Different clip_seed -> different output
+    assert not np.allclose(
+        p.apply(tone, clip_seed=1),
+        p.apply(tone, clip_seed=2),
+    )
+
+
+def test_pipeline_apply_is_order_independent(tone):
+    """The bug we fixed: apply() used shared state, so output depended on the
+    order calls happened. Now each apply() builds a fresh RNG from clip_seed."""
+    cfg = AugmentConfig(seed=99)
+    p = augment.AugPipeline(cfg)
+    a1 = p.apply(tone, clip_seed=1)
+    b1 = p.apply(tone, clip_seed=2)
+    # Reverse the call order — outputs must match the per-seed result
+    b2 = p.apply(tone, clip_seed=2)
+    a2 = p.apply(tone, clip_seed=1)
+    np.testing.assert_array_equal(a1, a2)
+    np.testing.assert_array_equal(b1, b2)
 
 
 def test_pipeline_changes_signal(tone):

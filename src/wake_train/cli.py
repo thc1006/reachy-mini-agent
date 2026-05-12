@@ -46,8 +46,14 @@ def cmd_synth(args: argparse.Namespace) -> int:
 
 
 def cmd_augment(args: argparse.Namespace) -> int:
-    """Walk synth dir, apply augmentation pipeline, write to aug dir."""
-    import numpy as np
+    """Walk synth dir, apply augmentation pipeline, write to aug dir.
+
+    Each (clip, copy_idx) gets a deterministic seed derived from the path +
+    copy index, so inserting a new clip into the synth dir does NOT shift
+    the augmentation of any prior clip.
+    """
+    import hashlib
+
     import soundfile as sf
 
     from .augment import AugPipeline
@@ -55,6 +61,7 @@ def cmd_augment(args: argparse.Namespace) -> int:
     cfg = cfgmod.get(args.scope)
     pipeline = AugPipeline(cfg.augment, sample_rate=cfg.train.sample_rate)
     cfg.aug_dir.mkdir(parents=True, exist_ok=True)
+    base_seed = cfg.augment.seed
     n = 0
     for wav in sorted(cfg.synth_dir.rglob("*.wav")):
         rel = wav.relative_to(cfg.synth_dir)
@@ -64,7 +71,9 @@ def cmd_augment(args: argparse.Namespace) -> int:
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         for k in range(args.n_per_clip):
-            mutated = pipeline.apply(audio)
+            key = f"{rel.as_posix()}|{k}|{base_seed}".encode()
+            clip_seed = int.from_bytes(hashlib.sha1(key).digest()[:4], "big")
+            mutated = pipeline.apply(audio, clip_seed=clip_seed)
             stem, suffix = out.stem, out.suffix
             sf.write(str(out.with_name(f"{stem}_aug{k:02d}{suffix}")),
                      mutated, sr, subtype="PCM_16")

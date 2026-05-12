@@ -146,14 +146,17 @@ def synthesize_phrase_set(
         pcm16 = np.concatenate(parts)
 
         if voice_sr != sample_rate:
-            ratio = sample_rate / voice_sr
-            new_len = int(round(pcm16.size * ratio))
-            x = np.linspace(0.0, pcm16.size - 1, new_len, dtype=np.float64)
-            idx0 = np.floor(x).astype(np.int64)
-            idx1 = np.clip(idx0 + 1, 0, pcm16.size - 1)
-            frac = (x - idx0).astype(np.float64)
-            pcm16 = (((1.0 - frac) * pcm16[idx0] + frac * pcm16[idx1])
-                     .astype(np.int16))
+            # Anti-aliased polyphase resample (Piper's 22050 -> 16000 is a
+            # downsample; naive linear interp folds anything above 8 kHz back
+            # into the band and gave the wake-detection model a Piper-only
+            # alias signature to latch onto).
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(sample_rate, voice_sr)
+            resampled = resample_poly(pcm16.astype(np.float32),
+                                       sample_rate // g, voice_sr // g)
+            np.clip(resampled, -32768, 32767, out=resampled)
+            pcm16 = resampled.astype(np.int16)
 
         pcm16 = _pad_to_duration(pcm16, sample_rate, CLIP_DURATION_S, pad_rng)
         sf.write(str(wav_path), pcm16, sample_rate, subtype="PCM_16")
