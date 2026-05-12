@@ -1962,7 +1962,7 @@ def do_conversation(mini):
     while get_state() == State.CONVERSATION and turns < 5:
         audio = record_utterance(mini)
         if audio is None:
-            speak(mini, "No worries! Come chat with me anytime!")
+            speak(mini, "沒事，隨時來找我聊聊。")
             break
         t_turn = time.perf_counter()
         text = transcribe(audio)
@@ -2000,7 +2000,7 @@ def do_conversation(mini):
         turns += 1
         # 偵測結束語
         if any(w in text.lower() for w in ["bye", "goodbye", "see you", "see ya", "thanks", "thank you", "that's all", "nothing"]):
-            speak(mini, "Bye.")
+            speak(mini, "掰掰。")
             do_action(mini, "greet")
             break
 
@@ -2117,24 +2117,24 @@ def tracking_loop(mini, stop_event: threading.Event):
                     if ratio > 0.15:
                         # 很近：驚嚇反應（簡短、自然）
                         greeting_lines = [
-                            "Whoa, close one!",
-                            "Hey, easy.",
-                            "Hi.",
+                            "哇，你好近。",
+                            "嘿，慢點。",
+                            "嗨。",
                         ]
                         greeting_action = "shake"
                     elif ratio > 0.05:
                         # 正常距離：簡短打招呼
                         greeting_lines = [
-                            "Hi.",
-                            "Hey there.",
-                            "Hello.",
+                            "嗨。",
+                            "你好。",
+                            "嘿。",
                         ]
                         greeting_action = "greet"
                     else:
                         # 遠處：低調揮手
                         greeting_lines = [
-                            "Hey.",
-                            "Hi.",
+                            "嘿。",
+                            "嗨。",
                             None,            # 70% 機率不講話只揮手
                             None,
                             None,
@@ -2182,7 +2182,7 @@ def tracking_loop(mini, stop_event: threading.Event):
         # IDLE 時偶爾四處張望，少講話
         if get_state() == State.IDLE and time.time() - idle_wander_t > 30:
             idle_wander_t = time.time()
-            idle_lines = [None] * 8 + ["Hmm.", "..."]   # 80% 純動作不講話
+            idle_lines = [None] * 8 + ["嗯。", "..."]   # 80% 純動作不講話
             line = random.choice(idle_lines)
             def idle_action(l=line):
                 do_action(mini, "look_around")
@@ -2255,7 +2255,7 @@ def main():
         hands.start()
         vision.start()
 
-        speak(mini, "Online.")
+        speak(mini, "上線了。")
         print("\n── 等待有人靠近（Ctrl+C 結束）──")
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")
