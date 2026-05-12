@@ -81,7 +81,27 @@ _last_cmd_pitch_deg     = 0.0
 _last_cmd_yaw_deg       = 0.0
 _last_cmd_body_yaw_rad  = 0.0
 _cmd_state_lock         = threading.Lock()
-FACE_TRACK_MAX_DELTA_DEG = float(os.getenv("FACE_TRACK_MAX_DELTA_DEG", "1.5"))
+
+
+def _parse_face_track_max_delta_deg() -> float:
+    """Parse FACE_TRACK_MAX_DELTA_DEG env, sanitize to safe range.
+    Negative / NaN / non-numeric / out-of-range values fall back to 1.5°.
+    The clamp logic assumes max_d >= 0; a negative max_d inverts the bounds
+    and pins output far from target. NaN propagates through max/min and
+    poisons every set_target call. Out-of-range >45° effectively disables
+    rate limiting. So we clamp to [0.1, 45.0] and reject NaN.
+    """
+    raw = os.getenv("FACE_TRACK_MAX_DELTA_DEG", "1.5")
+    try:
+        v = float(raw)
+    except (ValueError, TypeError):
+        return 1.5
+    if v != v:                # NaN check (NaN != NaN)
+        return 1.5
+    return max(0.1, min(45.0, v))
+
+
+FACE_TRACK_MAX_DELTA_DEG = _parse_face_track_max_delta_deg()
 
 
 def note_head_command(pitch_deg: float | None = None,
@@ -1924,6 +1944,26 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
                     try:
                         result = _exec_tool(name, args if isinstance(args, dict) else {})
                         print(f"  [stream 工具] {name}({args}) → {str(result)[:120]}")
+                        # Streaming path is one-shot (no second LLM round), so
+                        # tool results carrying natural-language fields (vision
+                        # tools like see_what / find_in_view / count_items)
+                        # never reach the user. Speak them directly here.
+                        # Cap length so a 2 KB scene description doesn't trigger
+                        # a 30 s TTS playback.
+                        if isinstance(result, dict):
+                            spoken = (
+                                result.get("description")
+                                or result.get("answer")
+                                or result.get("note")
+                                or (str(result.get("count", "")) + " 個。" if isinstance(result.get("count"), int) else None)
+                            )
+                            if spoken and isinstance(spoken, str):
+                                spoken = spoken.strip()
+                                if 1 <= len(spoken) <= 300:
+                                    try:
+                                        asyncio.run(_stream_tts(spoken, mini))
+                                    except Exception as _e:
+                                        print(f"  [post-tool TTS err] {_e}")
                     except Exception as e:
                         print(f"  [stream 工具錯誤] {name}: {e}")
         except Exception as e:

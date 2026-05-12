@@ -21,6 +21,20 @@ export LLM_STREAMING=1                # sentence-by-sentence streaming → faste
 export LLM_TOOLS=1                    # enable tool-calling (works for both vLLM + Ollama backends)
 export TTS_ENGINE=edge
 export TTS_GAIN=0.35
+# Lock to "Google 小姐" zh-TW female voice for all output (including English
+# fragments — Chinese-accented English is preferred over voice switching
+# mid-conversation). Unset (or set empty) to fall back to pick_voice() auto-routing.
+export TTS_VOICE=zh-TW-HsiaoYuNeural
 export KOKORO_URL=http://localhost:8880
 export WHISPER_URL=http://localhost:8881
+
+# Motor safety (per-frame delta clamp for face tracker; see robot_brain.py
+# _clamp_pose_delta). 1.5° at 30 FPS = 45°/sec max angular speed.
+export FACE_TRACK_MAX_DELTA_DEG=1.5
+
+# Observability: motor command JSONL log (no-op if path unset).
+# Cap at ~100 MB via separate rotation policy (logrotate or similar) —
+# at production rates the file grows ~480 MB/day untended.
+export MOTOR_LOG_PATH=/home/reachym/dev/reachy-agent/robot/logs/motor.log
+
 exec .venv/bin/python robot_brain.py
