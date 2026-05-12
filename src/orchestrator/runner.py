@@ -70,11 +70,19 @@ class ConcurrentRunner:
         # Concurrent path: opt INTO on-demand vision (the architectural
         # win) and disable the periodic worker by default (caller may
         # override via ``perception_cfg.periodic_vision_interval_ms``).
-        cfg = perception_cfg
-        if cfg is not None and not cfg.enable_on_demand_vision:
+        # If the caller doesn't supply a config at all, build one with
+        # on-demand vision enabled — otherwise Perception's own default
+        # would land us at enable_on_demand_vision=False, silently
+        # disabling the feature this runner is named after.
+        if perception_cfg is None:
+            cfg = PerceptionConfig(enable_on_demand_vision=True,
+                                   periodic_vision_interval_ms=0.0)
+        elif not perception_cfg.enable_on_demand_vision:
             cfg = PerceptionConfig(**{
-                **cfg.__dict__, "enable_on_demand_vision": True,
+                **perception_cfg.__dict__, "enable_on_demand_vision": True,
             })
+        else:
+            cfg = perception_cfg
         self.perception = Perception(
             self.bus, cfg,
             streaming_stt=streaming_stt,
@@ -211,12 +219,19 @@ class SerialRunner:
     ) -> None:
         self.bus = EventBus()
         # Serial baseline: no on-demand vision, only the periodic worker
-        # (matches production ``vision_worker`` at 30s).
-        cfg = perception_cfg
-        if cfg is not None and cfg.enable_on_demand_vision:
+        # (matches production ``vision_worker`` at 30s). If no config is
+        # supplied, build one with periodic vision enabled — otherwise
+        # the baseline would silently run without any vision at all and
+        # bench's scene-age comparison would be meaningless.
+        if perception_cfg is None:
+            cfg = PerceptionConfig(enable_on_demand_vision=False,
+                                   periodic_vision_interval_ms=30000.0)
+        elif perception_cfg.enable_on_demand_vision:
             cfg = PerceptionConfig(**{
-                **cfg.__dict__, "enable_on_demand_vision": False,
+                **perception_cfg.__dict__, "enable_on_demand_vision": False,
             })
+        else:
+            cfg = perception_cfg
         self.perception = Perception(
             self.bus, cfg,
             streaming_stt=False,
