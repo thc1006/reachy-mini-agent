@@ -12,6 +12,8 @@ import datetime as _dt
 import json as _json
 import os as _os
 import re as _re
+import threading as _threading
+import urllib.parse as _urlparse
 import urllib.request as _urlreq
 from typing import Any, Callable
 
@@ -236,8 +238,9 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
         if v > hi: clipped = True; return hi
         return v
     p, y, r = _clip(p), _clip(y), _clip(r)
-    # SAFETY: enforce minimum duration. duration<1.5s is rejected up to 1.5s.
-    # LLM may try to set duration=0 or omit it — we always end up safe.
+    # SAFETY: enforce minimum duration. Anything below MOTOR_MIN_DURATION_S
+    # (env, default 1.8s) is raised up to it. LLM may pass duration=0 or
+    # omit it — clamp always ends up safe.
     MIN_DUR = float(_os.getenv("MOTOR_MIN_DURATION_S", "1.8"))
     try:
         d = max(MIN_DUR, float(duration) if duration is not None else MIN_DUR)
@@ -273,10 +276,6 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
         result["clipped"] = clipped
         result["duration_s"] = d
     return result
-
-
-import urllib.parse as _urlparse
-import threading as _threading
 
 
 def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_clip") -> None:
@@ -399,15 +398,16 @@ _EMOTION_ALIAS = {
 def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
     """Play a pre-recorded animation (emotion OR dance) from official HF libraries.
 
-    Routing:
+    Routing (matches implementation order):
       1. name in dances library (19 names: yeah_nod / chicken_peck / chin_lead / ...)
          → play directly from pollen-robotics/reachy-mini-dances-library
-      2. name == "dance" / "dancing" / "boogie" / "groove" → default dance "yeah_nod"
-      3. name in alias map (happy / cheerful / sad / curious / proud / loving ...)
+      2. name == "dance" / "dancing" / "boogie" / "groove" / "jig" → default dance "yeah_nod"
+      3. name matches an emotions-library clip exactly (e.g. dance3, cheerful2,
+         enthusiastic2, proud3, yes_sad1, oops2, understanding2)
+         → play directly from pollen-robotics/reachy-mini-emotions-library
+      4. name in alias map (happy / cheerful / sad / curious / proud / loving ...)
          → translate to clip and play from emotions library
-      4. name matches an emotions-library clip exactly (e.g. dance3, cheerful2)
-         → play directly
-      5. otherwise → error
+      5. otherwise → error with hint of valid names
 
     NOTE: clip playback speed is controlled by the recorded JSON timeline on the
     daemon, NOT by this handler. The face tracker delta clamp in robot_brain.py
@@ -592,11 +592,12 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
     ),
     "move_head": (
         _spec("move_head",
-              "Move the robot head to a pose in degrees. All axes optional, default 0. Safe range ±25°.",
+              "Move the robot head smoothly to a pose in degrees. All axes optional, default 0. Safe range ±25°.",
               {
-                  "pitch": {"type": "number", "description": "Head tilt up/down in degrees (+down)."},
-                  "yaw":   {"type": "number", "description": "Head turn left/right in degrees (+right)."},
-                  "roll":  {"type": "number", "description": "Head tilt sideways in degrees."},
+                  "pitch":    {"type": "number", "description": "Head tilt up/down in degrees (+down)."},
+                  "yaw":      {"type": "number", "description": "Head turn left/right in degrees (+right)."},
+                  "roll":     {"type": "number", "description": "Head tilt sideways in degrees."},
+                  "duration": {"type": "number", "description": "Optional seconds for the move. Floor of ~1.8s is enforced for safety; pass a larger value for a slower, more expressive motion (e.g. 3.0 for a deliberate look)."},
               }),
         _tool_move_head,
     ),

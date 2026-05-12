@@ -1131,8 +1131,14 @@ happy | nod | shake | think | greet
 These are decorative only — they do NOT move the robot.
 
 ROBOT CAPABILITIES — your real tools (always use the exact names below):
-  move_head(pitch?, yaw?, roll?)    — degrees, ±25° safe range
-  play_emotion(name)                — enum: happy | sad | curious | think | greet | shake | nod
+  move_head(pitch?, yaw?, roll?, duration?)  — degrees, ±25° safe range; duration in seconds (≥1.8 enforced)
+  play_emotion(name)                — emotions OR dances:
+      emotion alias: happy / sad / curious / thoughtful / greet / nod / shake / surprised /
+                     scared / proud / loving / tired / confused / calm / etc.
+      dance generic: "dance" → default dance
+      dance specific: yeah_nod / jackson_square / dizzy_spin / pendulum_swing /
+                     groovy_sway_and_roll / chicken_peck / side_to_side_sway / etc. (19 total)
+      direct clip: any name from emotions library (cheerful2, proud3, yes_sad1, dance3 ...)
   stop_motion()                     — stop all motion (use for any "stop" intent)
   see_what(query?)                  — describe what the camera sees
   find_in_view(description)         — locate a specific object/person
