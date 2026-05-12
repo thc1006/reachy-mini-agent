@@ -214,10 +214,16 @@ def _tool_stop_motion(**_kwargs) -> dict:
 
 
 def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
+                    duration: float | None = None,
                     **_kwargs) -> dict:
     """Move head to (pitch, yaw, roll) in degrees. Safe range: ±25° per axis.
 
-    Values outside range are clamped silently (not an error — LLM may overshoot).
+    Always uses smooth minjerk interpolation with duration clamped to at least
+    MOTOR_MIN_DURATION_S seconds. Instant motion is forbidden — the pre-recorded
+    look_around path was deprecated because its speed startles users and stresses
+    the motors (memory: reference_reachy_mini_wireless_motor.md).
+
+    Values outside ±25° are clamped silently (not an error — LLM may overshoot).
     """
     try:
         p = float(pitch); y = float(yaw); r = float(roll)
@@ -230,15 +236,36 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
         if v > hi: clipped = True; return hi
         return v
     p, y, r = _clip(p), _clip(y), _clip(r)
-    # Call daemon (goal_head_pose-ish — daemon's move API accepts pose dicts)
-    result = _post_daemon("/api/move/play/look_around", {"pitch": p, "yaw": y, "roll": r})
+    # SAFETY: enforce minimum duration. duration<1.5s is rejected up to 1.5s.
+    # LLM may try to set duration=0 or omit it — we always end up safe.
+    MIN_DUR = float(_os.getenv("MOTOR_MIN_DURATION_S", "1.8"))
+    try:
+        d = max(MIN_DUR, float(duration) if duration is not None else MIN_DUR)
+    except (TypeError, ValueError):
+        d = MIN_DUR
+    body = {
+        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0, "roll": r, "pitch": p, "yaw": y},
+        "antennas": None,
+        "body_yaw": None,
+        "duration": d,
+        "interpolation": "minjerk",
+    }
+    result = _post_daemon("/api/move/goto", body)
     if clipped:
         result["clipped"] = True
+    result["duration_s"] = d
     return result
 
 
 def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
-    """Play a pre-baked emotion animation: happy | sad | curious | think | greet."""
+    """Play a pre-baked emotion animation: happy | sad | curious | think | greet.
+
+    NOTE: motion speed of these animations is controlled by the daemon's
+    pre-recorded move dataset and is NOT under this handler's control. If
+    any specific emotion plays too fast and startles the user, the fix is
+    on the daemon side (re-record or add speed param). See memory:
+    reference_reachy_mini_wireless_motor.md "動作絕對不能瞬間啟動" rule.
+    """
     name = (name or "").strip().lower()
     ALLOWED = {"happy", "sad", "curious", "think", "greet", "shake", "nod"}
     if name not in ALLOWED:
