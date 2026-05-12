@@ -63,6 +63,67 @@ DETECT_HOLD      = 1.0      # 偵測到臉多久後主動打招呼（秒，短�
 COOLDOWN_TIME    = 8.0      # 打完招呼後幾秒內不重複打招呼（新路人經過馬上又會招呼）
 CONVO_TIMEOUT    = 6.0      # 對話等待超時（秒）
 
+# ── Motor safety: per-frame delta clamp + cross-component state sync ──────
+# Problem this solves: face tracker uses set_target (absolute pose, no rate
+# limit). When an external command (LLM tool_call, face_lost reset, emotion
+# handler) moves the head, face tracker's next frame computes a target based
+# on face-in-frame position and sends set_target — motor races to cover the
+# big delta (e.g. -15° → +14°), startling the user and stressing servos.
+#
+# Fix: track the last commanded head pose globally. Face tracker (and any
+# other set_target caller) clamps each frame's target to within
+# FACE_TRACK_MAX_DELTA_DEG of the last commanded pose. 1.5° × 30 FPS =
+# 45°/sec max angular speed — smooth and bounded.
+#
+# Tool_call paths must call note_head_command() AFTER their move so the
+# clamp uses an up-to-date baseline.
+_last_cmd_pitch_deg     = 0.0
+_last_cmd_yaw_deg       = 0.0
+_last_cmd_body_yaw_rad  = 0.0
+_cmd_state_lock         = threading.Lock()
+FACE_TRACK_MAX_DELTA_DEG = float(os.getenv("FACE_TRACK_MAX_DELTA_DEG", "1.5"))
+
+
+def note_head_command(pitch_deg: float | None = None,
+                      yaw_deg: float | None = None,
+                      body_yaw_rad: float | None = None,
+                      source: str = "unknown") -> None:
+    """Update the global last-commanded head pose. Must be called by any
+    component that issues a head command (face tracker, face_lost reset,
+    emotion handlers, LLM tool_call via robot_tools.py late import).
+    Side-effect logs to MOTOR_LOG_PATH if env is set.
+    """
+    global _last_cmd_pitch_deg, _last_cmd_yaw_deg, _last_cmd_body_yaw_rad
+    with _cmd_state_lock:
+        if pitch_deg is not None:
+            _last_cmd_pitch_deg = float(pitch_deg)
+        if yaw_deg is not None:
+            _last_cmd_yaw_deg = float(yaw_deg)
+        if body_yaw_rad is not None:
+            _last_cmd_body_yaw_rad = float(body_yaw_rad)
+        snap_p, snap_y, snap_by = _last_cmd_pitch_deg, _last_cmd_yaw_deg, _last_cmd_body_yaw_rad
+    try:
+        from motor_log import log_motor
+        log_motor("note_head_command", source=source,
+                  in_pitch=pitch_deg, in_yaw=yaw_deg, in_body_yaw=body_yaw_rad,
+                  state_pitch=snap_p, state_yaw=snap_y, state_body_yaw=snap_by)
+    except Exception:
+        pass
+
+
+def _clamp_pose_delta(target_pitch_deg: float, target_yaw_deg: float) -> tuple[float, float, bool]:
+    """Clamp target pose to within FACE_TRACK_MAX_DELTA_DEG of last commanded.
+    Returns (clamped_pitch, clamped_yaw, was_clamped). Read-only — caller
+    must note_head_command() after the actual set_target succeeds."""
+    max_d = FACE_TRACK_MAX_DELTA_DEG
+    with _cmd_state_lock:
+        last_p = _last_cmd_pitch_deg
+        last_y = _last_cmd_yaw_deg
+    p = max(last_p - max_d, min(last_p + max_d, target_pitch_deg))
+    y = max(last_y - max_d, min(last_y + max_d, target_yaw_deg))
+    clamped = (abs(p - target_pitch_deg) > 1e-6) or (abs(y - target_yaw_deg) > 1e-6)
+    return p, y, clamped
+
 TTS_VOICE_EN     = "en-US-AnaNeural"        # 可愛小女孩英文聲
 TTS_VOICE_ZH     = "zh-TW-HsiaoYuNeural"    # 可愛台灣女生中文聲
 TTS_VOICE        = TTS_VOICE_EN              # 預設值（被 pick_voice 覆寫）
@@ -2081,15 +2142,30 @@ def tracking_loop(mini, stop_event: threading.Event):
             # **pitch 旋轉**：SDK pitch 正向=頭往下，所以 dy<0(臉高)→pitch負→抬頭
             head_pitch_deg = float(np.clip(smooth_dy * 20, -20, 20))
 
-            # 用 set_target（非阻塞 setpoint）→ 底層馬達控制器自己 50Hz 平滑
-            # 不需要 moved 門檻、不需要 current_yaw/z 追蹤，每幀直接送最新
+            # set_target 是 absolute pose、馬達看到大 delta 會全速衝。正常追臉
+            # delta 小 (連續幀 EMA 平滑) 看起來平滑；但若外力 (tool_call /
+            # face_lost reset / emotion) 動過 head、_last_cmd 跟實際 pose 還是
+            # 同步的、所以這層 clamp 限制每幀變化 ≤ FACE_TRACK_MAX_DELTA_DEG。
+            # 1.5°/frame × 30 FPS = 45°/sec 上限、不嚇人、追蹤仍夠快。
+            pitch_capped, yaw_capped, clamp_hit = _clamp_pose_delta(head_pitch_deg, head_yaw_deg)
             lock_ok = _motion_lock.acquire(blocking=False)
             if lock_ok:
                 try:
+                    try:
+                        from motor_log import log_motor
+                        log_motor("set_target", caller="face_tracker",
+                                  pitch=pitch_capped, yaw=yaw_capped, body_yaw=body_yaw_rad,
+                                  raw_pitch=head_pitch_deg, raw_yaw=head_yaw_deg,
+                                  clamped=clamp_hit,
+                                  smooth_dx=smooth_dx, smooth_dy=smooth_dy)
+                    except Exception:
+                        pass
                     mini.set_target(
-                        head=create_head_pose(pitch=head_pitch_deg, yaw=head_yaw_deg),
+                        head=create_head_pose(pitch=pitch_capped, yaw=yaw_capped),
                         body_yaw=body_yaw_rad,
                     )
+                    note_head_command(pitch_deg=pitch_capped, yaw_deg=yaw_capped,
+                                      body_yaw_rad=body_yaw_rad, source="face_tracker")
                 except Exception as e:
                     print(f"  [追蹤錯誤] {e}", flush=True)
                 finally:
@@ -2168,12 +2244,22 @@ def tracking_loop(mini, stop_event: threading.Event):
                     # 用 set_target(0,0) 從 ±25° 位置會瞬間衝回中、嚇人。改用 goto_target。
                     if _motion_lock.acquire(blocking=False):
                         try:
+                            try:
+                                from motor_log import log_motor
+                                log_motor("goto_target", caller="face_lost_reset",
+                                          pitch=0.0, yaw=0.0, body_yaw=0.0, duration=1.0)
+                            except Exception:
+                                pass
                             mini.goto_target(
                                 head=create_head_pose(pitch=0, yaw=0),
                                 body_yaw=0.0,
                                 duration=1.0,
                                 method="minjerk",
                             )
+                            # Sync state so face tracker resumes from 0/0 baseline,
+                            # not the last face-driven pose before face_lost.
+                            note_head_command(pitch_deg=0.0, yaw_deg=0.0,
+                                              body_yaw_rad=0.0, source="face_lost_reset")
                         except Exception:
                             pass
                         finally:

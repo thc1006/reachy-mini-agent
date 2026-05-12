@@ -250,6 +250,21 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
         "duration": d,
         "interpolation": "minjerk",
     }
+    # Log + sync robot_brain's commanded-pose state BEFORE the daemon call so
+    # the face tracker's next frame already knows the new baseline and won't
+    # race against the goto trajectory.
+    try:
+        from motor_log import log_motor
+        log_motor("tool_move_head", caller="llm_tool_call",
+                  pitch=p, yaw=y, roll=r, duration=d, clipped=clipped)
+    except Exception:
+        pass
+    try:
+        import robot_brain as _rb
+        _rb.note_head_command(pitch_deg=p, yaw_deg=y, body_yaw_rad=0.0,
+                              source="tool_move_head")
+    except Exception:
+        pass
     result = _post_daemon("/api/move/goto", body)
     if clipped:
         result["clipped"] = True
