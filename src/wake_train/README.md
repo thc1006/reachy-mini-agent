@@ -51,8 +51,15 @@ cd ~/reachy-mini
 git checkout feature/wake-command-training
 
 source ~/wake_train/bin/activate          # venv prepared during Phase B1 prep
-pip install -q piper-tts openwakeword onnxruntime numpy soundfile \
-              torch huggingface_hub
+# Phase B1 prep installed: piper-tts, openwakeword, onnxruntime, numpy,
+# soundfile, huggingface_hub. Two additions needed for training:
+pip install -q torch                      # ~2 GB; required by train.py / export.py
+# Second POC voice (Phase B1 prep only fetched zh_CN-huayan-medium):
+mkdir -p ~/wake_train/voices
+for f in en_US-amy-medium.onnx en_US-amy-medium.onnx.json; do
+  [ -f ~/wake_train/voices/$f ] || wget -q -O ~/wake_train/voices/$f \
+    https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/$f
+done
 
 bash scripts/wake_train/run_poc.sh
 ```
