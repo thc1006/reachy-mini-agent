@@ -68,6 +68,12 @@ class EventBus:
     def __init__(self) -> None:
         self._subs: list[_Subscription] = []
         self._lock = threading.Lock()
+        # Held briefly by publish() around its _stopping check + enqueue,
+        # and by stop() around its _stopping flip + sentinel placement.
+        # This closes the TOCTOU race where a publish() that passed the
+        # _stopping check could otherwise enqueue *after* stop() placed
+        # the sentinel, leaving its event silently behind the sentinel.
+        self._publish_lock = threading.Lock()
         self._started = False
         self._stopping = False
 
@@ -119,6 +125,10 @@ class EventBus:
     def start(self) -> None:
         if self._started:
             return
+        # Reset the stop-flag so a bus that was previously stop()-ed can
+        # be restarted (otherwise publish() would silently drop every
+        # subsequent event due to the lingering _stopping=True).
+        self._stopping = False
         for sub in self._subs:
             sub._stop = threading.Event()
             sub._thread = threading.Thread(
@@ -132,25 +142,33 @@ class EventBus:
 
     def stop(self, timeout: float = 5.0) -> None:
         """Signal subscribers to drain and exit. Returns once joined
-        (or ``timeout`` per subscriber elapses)."""
+        (or ``timeout`` per subscriber elapses).
+
+        Drain guarantee: any event that ``publish()`` accepted (i.e. its
+        critical section completed) before ``stop()`` flipped
+        ``_stopping`` *will* be processed by the subscriber. Events
+        published after the flip are silently dropped at publish() entry.
+        No event is ever enqueued behind the shutdown sentinel.
+        """
         if not self._started:
             return
-        self._stopping = True
-        for sub in self._subs:
-            try:
-                sub._q.put_nowait(self._SENTINEL)  # type: ignore[arg-type]
-            except queue.Full:
-                # drop one and try again so subscriber definitely exits
-                try:
-                    sub._q.get_nowait()
-                except queue.Empty:
-                    pass
+        # Atomic flip + signal + sentinel-attempt: publishers either
+        # finished their critical section before us (their event is
+        # already queued and will be drained) or acquire the lock after
+        # us and see _stopping=True (silent no-op).
+        with self._publish_lock:
+            self._stopping = True
+            for sub in self._subs:
+                if sub._stop is not None:
+                    sub._stop.set()
+                # Fast-exit hint. If the queue is full we DON'T evict —
+                # the existing event matters. Subscriber will drain
+                # normally and exit via the queue.Empty + _stop.is_set()
+                # fallback path in ``_sub_loop``.
                 try:
                     sub._q.put_nowait(self._SENTINEL)  # type: ignore[arg-type]
                 except queue.Full:
                     pass
-            if sub._stop is not None:
-                sub._stop.set()
         for sub in self._subs:
             if sub._thread is not None:
                 sub._thread.join(timeout=timeout)
@@ -163,19 +181,22 @@ class EventBus:
     def publish(self, event: Event) -> None:
         if not self._started:
             raise RuntimeError("publish() before start()")
-        if self._stopping:
-            # Bus is draining; events enqueued now would land behind the
-            # shutdown sentinel and never be processed. Silently drop so
-            # producers racing with stop() don't see a partially-handled
-            # event stream.
-            return
-        if event.ts == 0.0:
-            event.ts = time.time()
-        topic = type(event).topic
-        for sub in self._subs:
-            if self.WILDCARD not in sub.topics and topic not in sub.topics:
-                continue
-            self._enqueue(sub, event)
+        # The lock makes the (_stopping check + enqueue-to-all-subs)
+        # critical section atomic with respect to stop()'s flag flip.
+        # Without it, a publish() that passed the _stopping check could
+        # be pre-empted and resume enqueueing after stop() placed the
+        # shutdown sentinel — the event would land behind the sentinel
+        # and never be processed.
+        with self._publish_lock:
+            if self._stopping:
+                return
+            if event.ts == 0.0:
+                event.ts = time.time()
+            topic = type(event).topic
+            for sub in self._subs:
+                if self.WILDCARD not in sub.topics and topic not in sub.topics:
+                    continue
+                self._enqueue(sub, event)
 
     def _enqueue(self, sub: _Subscription, event: Event) -> None:
         try:
