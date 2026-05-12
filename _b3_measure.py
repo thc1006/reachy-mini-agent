@@ -15,9 +15,21 @@ import urllib.request
 sys.path.insert(0, "/home/reachym/dev/reachy-agent/robot")
 from robot_tools import get_tool_specs   # noqa: E402
 
-VLLM_URL  = "http://localhost:8000/v1/chat/completions"
-MODEL     = "qwen36-awq"
-TIMEOUT_S = 90
+BACKEND   = (sys.argv[1] if len(sys.argv) > 1 else "vllm").lower()  # "vllm" | "ollama"
+
+VLLM_URL    = "http://localhost:8000/v1/chat/completions"
+VLLM_MODEL  = "qwen36-awq"
+OLLAMA_URL  = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "qwen3.6:35b-a3b"
+
+if BACKEND == "vllm":
+    URL, MODEL = VLLM_URL, VLLM_MODEL
+elif BACKEND == "ollama":
+    URL, MODEL = OLLAMA_URL, OLLAMA_MODEL
+else:
+    raise SystemExit(f"unknown BACKEND={BACKEND}; use 'vllm' or 'ollama'")
+
+TIMEOUT_S = 120
 
 OLD_PROMPT = """\
 You are Reachy Mini, a curious desk robot. Warm, playful, specific, not cartoonish. No emoji prefixes. Do not pad.
@@ -119,14 +131,8 @@ assert len(TESTS) == 20
 TOOLS = get_tool_specs()
 
 
-def query(sys_prompt: str, user_msg: str, stream: bool = False) -> dict:
-    """Hit vLLM and return a non-stream-shaped dict regardless of mode.
-
-    Stream mode: parse SSE deltas, accumulate tool_calls + content, then
-    synthesize a non-stream-shape response so the rest of the pipeline is
-    mode-agnostic. Mirrors the accumulator pattern in robot_brain.py:1722.
-    """
-    payload = {
+def _build_payload_vllm(sys_prompt: str, user_msg: str, stream: bool) -> dict:
+    return {
         "model":       MODEL,
         "messages": [
             {"role": "system", "content": sys_prompt},
@@ -140,19 +146,74 @@ def query(sys_prompt: str, user_msg: str, stream: bool = False) -> dict:
         "stream":      stream,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+
+
+def _build_payload_ollama(sys_prompt: str, user_msg: str, stream: bool) -> dict:
+    return {
+        "model":      MODEL,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user",   "content": user_msg},
+        ],
+        "tools":      TOOLS,
+        "stream":     stream,
+        "think":      False,
+        "keep_alive": "30m",
+        "options": {
+            "temperature":    0.75,
+            "top_p":          0.92,
+            "repeat_penalty": 1.08,
+            "num_predict":    200,
+            "num_ctx":        8192,
+        },
+    }
+
+
+def _normalize_to_shape(content: str, tool_calls_list: list, wall_ms: float) -> dict:
+    """Return a canonical {choices:[{message:{content, tool_calls}}]} shape."""
+    return {
+        "_wall_ms": wall_ms,
+        "choices": [{
+            "message": {
+                "content":    content,
+                "tool_calls": tool_calls_list,
+            },
+        }],
+    }
+
+
+def query(sys_prompt: str, user_msg: str, stream: bool = False) -> dict:
+    """Hit the configured BACKEND and return canonical shape regardless of mode.
+
+    vLLM: /v1/chat/completions, OpenAI-format, SSE stream (data: prefix + [DONE])
+    ollama: /api/chat, ollama-format, NDJSON stream (one JSON object per line)
+    """
+    if BACKEND == "vllm":
+        payload = _build_payload_vllm(sys_prompt, user_msg, stream)
+    else:
+        payload = _build_payload_ollama(sys_prompt, user_msg, stream)
     req = urllib.request.Request(
-        VLLM_URL,
+        URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
     t = time.perf_counter()
+
     if not stream:
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        data["_wall_ms"] = (time.perf_counter() - t) * 1000
-        return data
+        wall_ms = (time.perf_counter() - t) * 1000
+        if BACKEND == "vllm":
+            return {**data, "_wall_ms": wall_ms}
+        # ollama non-stream shape -> normalize
+        msg = data.get("message") or {}
+        return _normalize_to_shape(
+            content=msg.get("content") or "",
+            tool_calls_list=msg.get("tool_calls") or [],
+            wall_ms=wall_ms,
+        )
 
-    # Streaming: parse SSE, accumulate tool_calls + content
+    # Streaming
     tool_acc: dict[int, dict] = {}
     content_buf = []
     with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
@@ -160,38 +221,56 @@ def query(sys_prompt: str, user_msg: str, stream: bool = False) -> dict:
             line = raw.strip()
             if not line:
                 continue
-            if line.startswith(b"data: "):
-                line = line[6:]
-            if line == b"[DONE]":
-                break
-            try:
-                obj = json.loads(line.decode("utf-8"))
-            except Exception:
-                continue
-            choices = obj.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta") or {}
-            if delta.get("content"):
-                content_buf.append(delta["content"])
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
-                slot = tool_acc.setdefault(idx, {"function": {"name": "", "arguments": ""}})
-                fn = tc.get("function") or {}
-                if fn.get("name"):
-                    slot["function"]["name"] = fn["name"]
-                if fn.get("arguments"):
-                    slot["function"]["arguments"] += fn["arguments"]
+            if BACKEND == "vllm":
+                if line.startswith(b"data: "):
+                    line = line[6:]
+                if line == b"[DONE]":
+                    break
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    content_buf.append(delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_acc.setdefault(idx, {"function": {"name": "", "arguments": ""}})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+            else:  # ollama NDJSON
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                msg = obj.get("message") or {}
+                if msg.get("content"):
+                    content_buf.append(msg["content"])
+                # ollama emits tool_calls as full structures (not deltas) — append/replace
+                for tc in msg.get("tool_calls") or []:
+                    idx = len(tool_acc)
+                    fn = tc.get("function") or {}
+                    # ollama gives arguments as already-parsed dict
+                    args = fn.get("arguments", {})
+                    if isinstance(args, dict):
+                        args_str = json.dumps(args, ensure_ascii=False)
+                    else:
+                        args_str = str(args)
+                    tool_acc[idx] = {"function": {"name": fn.get("name", ""), "arguments": args_str}}
+                if obj.get("done"):
+                    break
 
-    return {
-        "_wall_ms": (time.perf_counter() - t) * 1000,
-        "choices": [{
-            "message": {
-                "content":    "".join(content_buf),
-                "tool_calls": [tool_acc[i] for i in sorted(tool_acc.keys())],
-            },
-        }],
-    }
+    return _normalize_to_shape(
+        content="".join(content_buf),
+        tool_calls_list=[tool_acc[i] for i in sorted(tool_acc.keys())],
+        wall_ms=(time.perf_counter() - t) * 1000,
+    )
 
 
 def extract(resp: dict) -> tuple[list[str], str]:
@@ -296,7 +375,7 @@ def run_condition(label: str, sys_prompt: str, stream: bool, n_runs: int) -> dic
 def main():
     N_RUNS = 3
     print(f"Tools loaded: {len(TOOLS)}  ({[t['function']['name'] for t in TOOLS]})")
-    print(f"vLLM:         {VLLM_URL}  model={MODEL}")
+    print(f"BACKEND:      {BACKEND}  URL={URL}  model={MODEL}")
     print(f"Tests:        {len(TESTS)} prompts × 4 conditions × N={N_RUNS} repeats = {len(TESTS) * 4 * N_RUNS} evals")
 
     cells = {}
