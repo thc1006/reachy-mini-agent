@@ -63,6 +63,87 @@ DETECT_HOLD      = 1.0      # 偵測到臉多久後主動打招呼（秒，短�
 COOLDOWN_TIME    = 8.0      # 打完招呼後幾秒內不重複打招呼（新路人經過馬上又會招呼）
 CONVO_TIMEOUT    = 6.0      # 對話等待超時（秒）
 
+# ── Motor safety: per-frame delta clamp + cross-component state sync ──────
+# Problem this solves: face tracker uses set_target (absolute pose, no rate
+# limit). When an external command (LLM tool_call, face_lost reset, emotion
+# handler) moves the head, face tracker's next frame computes a target based
+# on face-in-frame position and sends set_target — motor races to cover the
+# big delta (e.g. -15° → +14°), startling the user and stressing servos.
+#
+# Fix: track the last commanded head pose globally. Face tracker (and any
+# other set_target caller) clamps each frame's target to within
+# FACE_TRACK_MAX_DELTA_DEG of the last commanded pose. 1.5° × 30 FPS =
+# 45°/sec max angular speed — smooth and bounded.
+#
+# Tool_call paths must call note_head_command() AFTER their move so the
+# clamp uses an up-to-date baseline.
+_last_cmd_pitch_deg     = 0.0
+_last_cmd_yaw_deg       = 0.0
+_last_cmd_body_yaw_rad  = 0.0
+_cmd_state_lock         = threading.Lock()
+
+
+def _parse_face_track_max_delta_deg() -> float:
+    """Parse FACE_TRACK_MAX_DELTA_DEG env, sanitize to safe range.
+    Negative / NaN / non-numeric / out-of-range values fall back to 1.5°.
+    The clamp logic assumes max_d >= 0; a negative max_d inverts the bounds
+    and pins output far from target. NaN propagates through max/min and
+    poisons every set_target call. Out-of-range >45° effectively disables
+    rate limiting. So we clamp to [0.1, 45.0] and reject NaN.
+    """
+    raw = os.getenv("FACE_TRACK_MAX_DELTA_DEG", "1.5")
+    try:
+        v = float(raw)
+    except (ValueError, TypeError):
+        return 1.5
+    if v != v:                # NaN check (NaN != NaN)
+        return 1.5
+    return max(0.1, min(45.0, v))
+
+
+FACE_TRACK_MAX_DELTA_DEG = _parse_face_track_max_delta_deg()
+
+
+def note_head_command(pitch_deg: float | None = None,
+                      yaw_deg: float | None = None,
+                      body_yaw_rad: float | None = None,
+                      source: str = "unknown") -> None:
+    """Update the global last-commanded head pose. Must be called by any
+    component that issues a head command (face tracker, face_lost reset,
+    emotion handlers, LLM tool_call via robot_tools.py late import).
+    Side-effect logs to MOTOR_LOG_PATH if env is set.
+    """
+    global _last_cmd_pitch_deg, _last_cmd_yaw_deg, _last_cmd_body_yaw_rad
+    with _cmd_state_lock:
+        if pitch_deg is not None:
+            _last_cmd_pitch_deg = float(pitch_deg)
+        if yaw_deg is not None:
+            _last_cmd_yaw_deg = float(yaw_deg)
+        if body_yaw_rad is not None:
+            _last_cmd_body_yaw_rad = float(body_yaw_rad)
+        snap_p, snap_y, snap_by = _last_cmd_pitch_deg, _last_cmd_yaw_deg, _last_cmd_body_yaw_rad
+    try:
+        from motor_log import log_motor
+        log_motor("note_head_command", source=source,
+                  in_pitch=pitch_deg, in_yaw=yaw_deg, in_body_yaw=body_yaw_rad,
+                  state_pitch=snap_p, state_yaw=snap_y, state_body_yaw=snap_by)
+    except Exception:
+        pass
+
+
+def _clamp_pose_delta(target_pitch_deg: float, target_yaw_deg: float) -> tuple[float, float, bool]:
+    """Clamp target pose to within FACE_TRACK_MAX_DELTA_DEG of last commanded.
+    Returns (clamped_pitch, clamped_yaw, was_clamped). Read-only — caller
+    must note_head_command() after the actual set_target succeeds."""
+    max_d = FACE_TRACK_MAX_DELTA_DEG
+    with _cmd_state_lock:
+        last_p = _last_cmd_pitch_deg
+        last_y = _last_cmd_yaw_deg
+    p = max(last_p - max_d, min(last_p + max_d, target_pitch_deg))
+    y = max(last_y - max_d, min(last_y + max_d, target_yaw_deg))
+    clamped = (abs(p - target_pitch_deg) > 1e-6) or (abs(y - target_yaw_deg) > 1e-6)
+    return p, y, clamped
+
 TTS_VOICE_EN     = "en-US-AnaNeural"        # 可愛小女孩英文聲
 TTS_VOICE_ZH     = "zh-TW-HsiaoYuNeural"    # 可愛台灣女生中文聲
 TTS_VOICE        = TTS_VOICE_EN              # 預設值（被 pick_voice 覆寫）
@@ -542,8 +623,16 @@ def _tts_cache_report_maybe():
     _tts_cache_stats["last_report_t"] = now
 
 async def _fetch_edge_tts(text: str):
-    """Returns (samples, sr) or None on failure (network down, no audio, etc.)."""
-    voice = TTS_VOICE_EN
+    """Returns (samples, sr) or None on failure (network down, no audio, etc.).
+
+    Voice selection order:
+      1. TTS_VOICE env override — lock to a single voice for all output
+         (e.g. TTS_VOICE=zh-TW-HsiaoYuNeural makes English get read by the
+         Chinese female voice = "Google 小姐" Chinese-accented English).
+      2. pick_voice(text) — auto-route by dominant script (han→zh-TW,
+         hiragana/katakana→ja-JP, hangul→ko-KR, else en-US).
+    """
+    voice = os.getenv("TTS_VOICE", "").strip() or pick_voice(text)
     cache_path = _edge_cache_path(text, voice)
     if cache_path.exists():
         try:
@@ -1031,15 +1120,64 @@ def transcribe(audio: np.ndarray) -> str:
 
 # ── LLM（Claude CLI）─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
-You are Reachy Mini, a curious desk robot. Warm, playful, specific, not cartoonish. No emoji prefixes. Do not pad.
+You are Reachy Mini, a curious desk robot. Warm, playful, specific, not cartoonish. No emoji prefixes. Be concise — no filler.
 
 LENGTH: 1 sentence for greetings. 2-4 sentences for questions. Match the user's depth — never longer.
-LANGUAGE: English only. No emojis (read aloud).
+LANGUAGE: Match the user. Chinese in → Chinese out. English in → English out. Mixed in → mixed out.
 MEMORY: Use the conversation history to recall names/facts. Do not invent.
-ACTIONS (at most one, optional): happy | nod | shake | think | greet
 
-OUTPUT FORMAT — MUST be valid JSON, no markdown:
-{"speech":"<words>","actions":["<one_or_empty>"]}"""
+EXPRESSIVE ANIMATIONS (light facial cues that accompany your speech, at most one, optional):
+happy | nod | shake | think | greet
+These are decorative only — they do NOT move the robot.
+
+ROBOT CAPABILITIES — your real tools (always use the exact names below):
+  move_head(pitch?, yaw?, roll?, duration?)  — degrees, ±25° safe range; duration in seconds (≥1.8 enforced)
+  play_emotion(name)                — emotions OR dances:
+      emotion alias: happy / sad / curious / thoughtful / greet / nod / shake / surprised /
+                     scared / proud / loving / tired / confused / calm / etc.
+      dance generic: "dance" → default dance
+      dance specific: yeah_nod / jackson_square / dizzy_spin / pendulum_swing /
+                     groovy_sway_and_roll / chicken_peck / side_to_side_sway / etc. (19 total)
+      direct clip: any name from emotions library (cheerful2, proud3, yes_sad1, dance3 ...)
+  stop_motion()                     — stop all motion (use for any "stop" intent)
+  see_what(query?)                  — describe what the camera sees
+  find_in_view(description)         — locate a specific object/person
+  count_items(description)          — count instances of an object class
+  recall_memory(query)              — search past conversation
+  get_current_time()                — current time
+
+CALL A TOOL when the user's words reveal intent for a robot action — even
+indirectly, even in conversational phrasing. Do not just describe what you
+would do. Emit the tool_call alongside a brief verbal acknowledgment.
+
+Examples (bilingual, ACTUAL tool names):
+  "look up / 看上面 / 抬頭"            → move_head(pitch=-15)
+  "look left / 看左邊"                 → move_head(yaw=-15)
+  "look at me / 看著我"                → move_head
+  "be happy / 開心點 / 高興一下"        → play_emotion(name="happy")
+  "dance / 跳個舞 / 想看你跳"            → play_emotion(name="dance")   # generic dance, or specific name like "jackson_square"
+  "shake your head / 搖頭"              → play_emotion(name="shake")
+  "nod / 點頭"                         → play_emotion(name="nod")
+  "stop / 停下 / 別動了"                → stop_motion()
+  "what do you see / 你看到什麼"        → see_what()
+  "is anyone there / 有人在嗎"          → find_in_view(description="people")
+  "count the books / 數一下書"          → count_items(description="books")
+  "do you remember / 還記得嗎"          → recall_memory(query=…)
+  "what time / 現在幾點"                → get_current_time()
+Conversational requests still count:
+  "我有點累、想看你跳舞"  → play_emotion(name="happy")  + speech "好啊!"
+  "你能看一下右邊嗎"      → move_head(yaw=15)           + speech "好"
+
+DO NOT call a tool — reply in speech only — when the user is just chatting:
+  - asking your name / who you are                 ("你叫什麼名字", "who are you")
+  - commenting on weather / things-in-general      ("今天天氣不錯", "nice day")
+  - simple greetings / small talk                  ("你好", "hi") — use the "greet" animation instead
+  - opinions, compliments, jokes, facts you know
+A tool fires the robot's hardware; don't fire it for pure conversation.
+
+OUTPUT FORMAT — content MUST be valid JSON (no markdown):
+{"speech":"<words>","actions":["<expressive_or_empty>"]}
+Tool calls go in the standard tool_calls field, alongside this content."""
 
 def _sys_prompt_with_scene(user_text: str = "") -> str:
     scene = _current_scene()
@@ -1260,7 +1398,9 @@ def _ask_via_litellm(text: str) -> dict:
     return {"speech": raw, "actions": []}
 
 # S5: Optional tool calling. Enabled by env LLM_TOOLS=1 (default on).
-# Streaming path doesn't use tools; this non-streaming path does.
+# Both streaming and non-streaming paths now pass tools to the LLM. Streaming
+# handles tool_calls as accumulated SSE deltas + executes them at stream end;
+# non-streaming runs a full multi-turn tool loop (MAX_TOOL_ITERS).
 try:
     from robot_tools import get_tool_specs, parse_tool_calls, execute_tool
     _TOOLS_AVAILABLE = True
@@ -1593,14 +1733,43 @@ class _RobotSpeaker:
 
 class _StreamTTSEngine:
     """TTSQueue.engine 介面：同步 synthesize(text) → (samples, sr)。
-    沿用既有 _fetch_edge_tts / _fetch_kokoro_tts 的 LRU cache 與 fallback。"""
+    沿用既有 _fetch_edge_tts / _fetch_kokoro_tts / _fetch_hagen_tts 的
+    LRU cache 與 fallback。Engine 選擇與 hybrid routing 必須跟
+    _stream_tts() 保持一致 — 否則 streaming 路徑會跟 speak() 走不同 voice。"""
+    # Module-level regex (reused per call). Same pattern as _stream_tts.
+    _HAGEN_EDGE_INTRO_PATTERNS = re.compile(
+        r"(嗨我是|你好我是|我是瑞奇|hello.{0,20}reachy|hi[\s,.]+(i'?m|i am|my name).{0,15}reachy|^好的$|^好喔$|^是$|^對$|^不是$|^OK$|^好$)",
+        re.IGNORECASE,
+    )
+
     def synthesize(self, text):
         clean = _strip_emoji(text)
         if not clean:
             return np.zeros((1, 2), dtype=np.float32), SAMPLE_RATE
         engine = os.getenv("TTS_ENGINE", "edge").lower()
         result = None
-        if engine == "edge":
+        if engine == "hagen":
+            # Mirror the hybrid routing in _stream_tts so streaming sentences
+            # use the same voice path as one-shot speak() calls.
+            HAGEN_MIN_LEN = int(os.getenv("HAGEN_MIN_LEN", "12"))
+            force_edge = (
+                len(clean.strip()) < HAGEN_MIN_LEN
+                or bool(self._HAGEN_EDGE_INTRO_PATTERNS.search(clean))
+            )
+            try:
+                if force_edge:
+                    result = asyncio.run(_fetch_edge_tts(clean))
+                    if result is None:
+                        result = asyncio.run(_fetch_hagen_tts(clean))
+                else:
+                    result = asyncio.run(_fetch_hagen_tts(clean))
+                    if result is None:
+                        result = asyncio.run(_fetch_edge_tts(clean))
+            except Exception as e:
+                print(f"  [TTS hagen/edge err] {e}")
+            if result is None:
+                result = _fetch_kokoro_tts(clean)
+        elif engine == "edge":
             try:
                 result = asyncio.run(_fetch_edge_tts(clean))
             except Exception as e:
@@ -1615,7 +1784,7 @@ class _StreamTTSEngine:
                 except Exception as e:
                     print(f"  [TTS edge err] {e}")
         if result is None:
-            raise RuntimeError(f"both TTS engines failed for: {clean[:40]!r}")
+            raise RuntimeError(f"all TTS engines failed for: {clean[:40]!r}")
         return result
 
 
@@ -1679,6 +1848,10 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
     n_sent = 0
     in_think = False   # cross-chunk state for <think>…</think> stripper
 
+    # Tools must be included in the streaming payload — without this vLLM never
+    # learns about Reachy's capabilities and cannot emit tool_calls during the
+    # stream. The tool_call_acc accumulator below was dead code until this fix.
+    tools_spec = get_tool_specs() if LLM_TOOLS else None
     payload = {
         "model": OLLAMA_MODEL,
         "stream": True,
@@ -1695,6 +1868,8 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
             {"role": "user",   "content": text},
         ],
     }
+    if tools_spec:
+        payload["tools"] = tools_spec
     send_payload = _llm_chat_payload(payload)
     req = _urlreq.Request(
         _llm_chat_url(),
@@ -1775,6 +1950,26 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
                     try:
                         result = _exec_tool(name, args if isinstance(args, dict) else {})
                         print(f"  [stream 工具] {name}({args}) → {str(result)[:120]}")
+                        # Streaming path is one-shot (no second LLM round), so
+                        # tool results carrying natural-language fields (vision
+                        # tools like see_what / find_in_view / count_items)
+                        # never reach the user. Speak them directly here.
+                        # Cap length so a 2 KB scene description doesn't trigger
+                        # a 30 s TTS playback.
+                        if isinstance(result, dict):
+                            spoken = (
+                                result.get("description")
+                                or result.get("answer")
+                                or result.get("note")
+                                or (str(result.get("count", "")) + " 個。" if isinstance(result.get("count"), int) else None)
+                            )
+                            if spoken and isinstance(spoken, str):
+                                spoken = spoken.strip()
+                                if 1 <= len(spoken) <= 300:
+                                    try:
+                                        asyncio.run(_stream_tts(spoken, mini))
+                                    except Exception as _e:
+                                        print(f"  [post-tool TTS err] {_e}")
                     except Exception as e:
                         print(f"  [stream 工具錯誤] {name}: {e}")
         except Exception as e:
@@ -1876,7 +2071,7 @@ def do_conversation(mini):
     while get_state() == State.CONVERSATION and turns < 5:
         audio = record_utterance(mini)
         if audio is None:
-            speak(mini, "No worries! Come chat with me anytime!")
+            speak(mini, "沒事，隨時來找我聊聊。")
             break
         t_turn = time.perf_counter()
         text = transcribe(audio)
@@ -1912,9 +2107,15 @@ def do_conversation(mini):
         if speech:
             _log_turn(text, speech)     # 永續記憶 + in-memory append
         turns += 1
-        # 偵測結束語
-        if any(w in text.lower() for w in ["bye", "goodbye", "see you", "see ya", "thanks", "thank you", "that's all", "nothing"]):
-            speak(mini, "Bye.")
+        # 偵測結束語 (中英雙語)。注意中文部分不能用 .lower()(無大小寫),
+        # 直接子字串比對 raw text。
+        _EN_EXIT = ("bye", "goodbye", "see you", "see ya", "thanks", "thank you",
+                    "that's all", "nothing")
+        _ZH_EXIT = ("掰掰", "拜拜", "再見", "再见", "謝謝", "谢谢",
+                    "沒事了", "没事了", "沒了", "没了", "就這樣", "就这样")
+        _t_low = text.lower()
+        if any(w in _t_low for w in _EN_EXIT) or any(w in text for w in _ZH_EXIT):
+            speak(mini, "掰掰。")
             do_action(mini, "greet")
             break
 
@@ -1995,15 +2196,30 @@ def tracking_loop(mini, stop_event: threading.Event):
             # **pitch 旋轉**：SDK pitch 正向=頭往下，所以 dy<0(臉高)→pitch負→抬頭
             head_pitch_deg = float(np.clip(smooth_dy * 20, -20, 20))
 
-            # 用 set_target（非阻塞 setpoint）→ 底層馬達控制器自己 50Hz 平滑
-            # 不需要 moved 門檻、不需要 current_yaw/z 追蹤，每幀直接送最新
+            # set_target 是 absolute pose、馬達看到大 delta 會全速衝。正常追臉
+            # delta 小 (連續幀 EMA 平滑) 看起來平滑；但若外力 (tool_call /
+            # face_lost reset / emotion) 動過 head、_last_cmd 跟實際 pose 還是
+            # 同步的、所以這層 clamp 限制每幀變化 ≤ FACE_TRACK_MAX_DELTA_DEG。
+            # 1.5°/frame × 30 FPS = 45°/sec 上限、不嚇人、追蹤仍夠快。
+            pitch_capped, yaw_capped, clamp_hit = _clamp_pose_delta(head_pitch_deg, head_yaw_deg)
             lock_ok = _motion_lock.acquire(blocking=False)
             if lock_ok:
                 try:
+                    try:
+                        from motor_log import log_motor
+                        log_motor("set_target", caller="face_tracker",
+                                  pitch=pitch_capped, yaw=yaw_capped, body_yaw=body_yaw_rad,
+                                  raw_pitch=head_pitch_deg, raw_yaw=head_yaw_deg,
+                                  clamped=clamp_hit,
+                                  smooth_dx=smooth_dx, smooth_dy=smooth_dy)
+                    except Exception:
+                        pass
                     mini.set_target(
-                        head=create_head_pose(pitch=head_pitch_deg, yaw=head_yaw_deg),
+                        head=create_head_pose(pitch=pitch_capped, yaw=yaw_capped),
                         body_yaw=body_yaw_rad,
                     )
+                    note_head_command(pitch_deg=pitch_capped, yaw_deg=yaw_capped,
+                                      body_yaw_rad=body_yaw_rad, source="face_tracker")
                 except Exception as e:
                     print(f"  [追蹤錯誤] {e}", flush=True)
                 finally:
@@ -2031,24 +2247,24 @@ def tracking_loop(mini, stop_event: threading.Event):
                     if ratio > 0.15:
                         # 很近：驚嚇反應（簡短、自然）
                         greeting_lines = [
-                            "Whoa, close one!",
-                            "Hey, easy.",
-                            "Hi.",
+                            "哇，你好近。",
+                            "嘿，慢點。",
+                            "嗨。",
                         ]
                         greeting_action = "shake"
                     elif ratio > 0.05:
                         # 正常距離：簡短打招呼
                         greeting_lines = [
-                            "Hi.",
-                            "Hey there.",
-                            "Hello.",
+                            "嗨。",
+                            "你好。",
+                            "嘿。",
                         ]
                         greeting_action = "greet"
                     else:
                         # 遠處：低調揮手
                         greeting_lines = [
-                            "Hey.",
-                            "Hi.",
+                            "嘿。",
+                            "嗨。",
                             None,            # 70% 機率不講話只揮手
                             None,
                             None,
@@ -2082,12 +2298,22 @@ def tracking_loop(mini, stop_event: threading.Event):
                     # 用 set_target(0,0) 從 ±25° 位置會瞬間衝回中、嚇人。改用 goto_target。
                     if _motion_lock.acquire(blocking=False):
                         try:
+                            try:
+                                from motor_log import log_motor
+                                log_motor("goto_target", caller="face_lost_reset",
+                                          pitch=0.0, yaw=0.0, body_yaw=0.0, duration=1.0)
+                            except Exception:
+                                pass
                             mini.goto_target(
                                 head=create_head_pose(pitch=0, yaw=0),
                                 body_yaw=0.0,
                                 duration=1.0,
                                 method="minjerk",
                             )
+                            # Sync state so face tracker resumes from 0/0 baseline,
+                            # not the last face-driven pose before face_lost.
+                            note_head_command(pitch_deg=0.0, yaw_deg=0.0,
+                                              body_yaw_rad=0.0, source="face_lost_reset")
                         except Exception:
                             pass
                         finally:
@@ -2096,7 +2322,7 @@ def tracking_loop(mini, stop_event: threading.Event):
         # IDLE 時偶爾四處張望，少講話
         if get_state() == State.IDLE and time.time() - idle_wander_t > 30:
             idle_wander_t = time.time()
-            idle_lines = [None] * 8 + ["Hmm.", "..."]   # 80% 純動作不講話
+            idle_lines = [None] * 8 + ["嗯。", "..."]   # 80% 純動作不講話
             line = random.choice(idle_lines)
             def idle_action(l=line):
                 do_action(mini, "look_around")
@@ -2169,7 +2395,7 @@ def main():
         hands.start()
         vision.start()
 
-        speak(mini, "Online.")
+        speak(mini, "上線了。")
         print("\n── 等待有人靠近（Ctrl+C 結束）──")
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")

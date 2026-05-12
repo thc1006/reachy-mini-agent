@@ -12,6 +12,8 @@ import datetime as _dt
 import json as _json
 import os as _os
 import re as _re
+import threading as _threading
+import urllib.parse as _urlparse
 import urllib.request as _urlreq
 from typing import Any, Callable
 
@@ -214,10 +216,16 @@ def _tool_stop_motion(**_kwargs) -> dict:
 
 
 def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
+                    duration: float | None = None,
                     **_kwargs) -> dict:
     """Move head to (pitch, yaw, roll) in degrees. Safe range: ±25° per axis.
 
-    Values outside range are clamped silently (not an error — LLM may overshoot).
+    Always uses smooth minjerk interpolation with duration clamped to at least
+    MOTOR_MIN_DURATION_S seconds. Instant motion is forbidden — the pre-recorded
+    look_around path was deprecated because its speed startles users and stresses
+    the motors (memory: reference_reachy_mini_wireless_motor.md).
+
+    Values outside ±25° are clamped silently (not an error — LLM may overshoot).
     """
     try:
         p = float(pitch); y = float(yaw); r = float(roll)
@@ -230,20 +238,255 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
         if v > hi: clipped = True; return hi
         return v
     p, y, r = _clip(p), _clip(y), _clip(r)
-    # Call daemon (goal_head_pose-ish — daemon's move API accepts pose dicts)
-    result = _post_daemon("/api/move/play/look_around", {"pitch": p, "yaw": y, "roll": r})
-    if clipped:
-        result["clipped"] = True
+    # SAFETY: enforce minimum duration. Anything below MOTOR_MIN_DURATION_S
+    # (env, default 1.8s) is raised up to it. LLM may pass duration=0 or
+    # omit it — clamp always ends up safe.
+    MIN_DUR = float(_os.getenv("MOTOR_MIN_DURATION_S", "1.8"))
+    try:
+        d = max(MIN_DUR, float(duration) if duration is not None else MIN_DUR)
+    except (TypeError, ValueError):
+        d = MIN_DUR
+    body = {
+        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0, "roll": r, "pitch": p, "yaw": y},
+        "antennas": None,
+        "body_yaw": None,
+        "duration": d,
+        "interpolation": "minjerk",
+    }
+    # Always log the attempt (audit even on failure).
+    try:
+        from motor_log import log_motor
+        log_motor("tool_move_head", caller="llm_tool_call",
+                  pitch=p, yaw=y, roll=r, duration=d, clipped=clipped)
+    except Exception:
+        pass
+    result = _post_daemon("/api/move/goto", body)
+    # Only sync face-tracker baseline AFTER daemon accepts. If daemon rejects
+    # (network / busy / motor torque OFF), motor never moved — updating the
+    # baseline would make face tracker race toward a phantom pose. Also pass
+    # body_yaw_rad=None: this handler doesn't touch body yaw, so the baseline
+    # for body must stay at whatever was last actually commanded.
+    if isinstance(result, dict) and result.get("ok"):
+        try:
+            import robot_brain as _rb
+            _rb.note_head_command(pitch_deg=p, yaw_deg=y, body_yaw_rad=None,
+                                  source="tool_move_head")
+        except Exception:
+            pass
+        result["clipped"] = clipped
+        result["duration_s"] = d
     return result
 
 
+_resync_timer_lock = _threading.Lock()
+_resync_timer: _threading.Timer | None = None
+
+
+def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_clip") -> None:
+    """Schedule a debounced one-shot baseline resync after a recorded-move
+    clip is expected to finish. Queries the daemon for the actual head pose
+    and writes it into robot_brain's face-tracker baseline. Without this,
+    the baseline stays at its pre-clip value while the head physically
+    elsewhere — the next face-tracker frame races toward the stale baseline
+    causing a 20-30° instant snap (the symptom the delta-clamp was meant
+    to prevent).
+
+    Debounce: if a previous resync timer is still pending, cancel it. A
+    second clip fired before the first resync completes supersedes the
+    first — only the LAST clip's expected end time matters. Otherwise N
+    overlapping Timers would create out-of-order baseline writes.
+
+    Daemon endpoint: GET /api/state/present_head_pose → {pitch, yaw, roll}.
+    On failure (network / unknown format), falls back to neutral (0, 0) —
+    most pollen-robotics clips return to neutral, so this is a reasonable
+    last-resort default.
+    """
+    def _do_sync() -> None:
+        pitch, yaw = 0.0, 0.0
+        try:
+            req = _urlreq.Request(f"{DAEMON_BASE}/api/state/present_head_pose")
+            with _urlreq.urlopen(req, timeout=3) as resp:
+                pose = _json.loads(resp.read().decode("utf-8"))
+            if isinstance(pose, dict):
+                pitch = float(pose.get("pitch", 0.0))
+                yaw   = float(pose.get("yaw", 0.0))
+        except Exception:
+            pass  # fall through to neutral baseline
+        try:
+            import robot_brain as _rb
+            _rb.note_head_command(pitch_deg=pitch, yaw_deg=yaw,
+                                  body_yaw_rad=None, source=source)
+        except Exception:
+            pass
+
+    global _resync_timer
+    with _resync_timer_lock:
+        # Cancel any pending resync — last clip wins, no overlapping writes.
+        if _resync_timer is not None:
+            try:
+                _resync_timer.cancel()
+            except Exception:
+                pass
+        _resync_timer = _threading.Timer(max(0.5, float(delay_s)), _do_sync)
+        _resync_timer.daemon = True
+        _resync_timer.start()
+
+_DANCES_LIB   = "pollen-robotics/reachy-mini-dances-library"
+_EMOTIONS_LIB = "pollen-robotics/reachy-mini-emotions-library"
+
+# Dynamic discovery — query daemon's list endpoint at first use, cache result.
+# This way the catalog auto-syncs with whatever pollen-robotics publishes and
+# whatever extra datasets the user installs on the daemon. No hardcoded names.
+#
+# Fallback set is a minimal known-good list in case the daemon is unreachable
+# at module load time (then call retries on next invocation).
+_DANCE_NAMES_FALLBACK = {
+    "yeah_nod", "simple_nod", "side_to_side_sway", "groovy_sway_and_roll",
+    "jackson_square", "dizzy_spin", "pendulum_swing", "chicken_peck",
+}
+_dataset_cache: dict[str, set[str]] = {}
+_dataset_cache_lock = _threading.Lock()
+
+
+def _fetch_dataset_moves(dataset_full_name: str) -> set[str]:
+    """Return the set of move names available in ``dataset_full_name`` on the
+    daemon. Cached after first successful call. Empty set on failure."""
+    with _dataset_cache_lock:
+        cached = _dataset_cache.get(dataset_full_name)
+    if cached is not None:
+        return cached
+    encoded = _urlparse.quote(dataset_full_name, safe="")
+    url = f"{DAEMON_BASE}/api/move/recorded-move-datasets/list/{encoded}"
+    try:
+        req = _urlreq.Request(url)
+        with _urlreq.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, list):
+            result = set(data)
+            with _dataset_cache_lock:
+                _dataset_cache[dataset_full_name] = result
+            return result
+    except Exception:
+        pass
+    return set()
+
+
+def _get_dance_names() -> set[str]:
+    discovered = _fetch_dataset_moves(_DANCES_LIB)
+    return discovered if discovered else _DANCE_NAMES_FALLBACK
+
+
+def _get_emotion_clip_names() -> set[str]:
+    return _fetch_dataset_moves(_EMOTIONS_LIB)
+
+# LLM-friendly English names → emotions-library clip names. 80+ clips
+# available; this maps the common English emotion words an LLM would emit.
+_EMOTION_ALIAS = {
+    "happy": "cheerful1", "cheerful": "cheerful1", "joyful": "laughing1",
+    "laugh": "laughing1", "laughing": "laughing1",
+    "sad": "sad1", "lonely": "lonely1", "downcast": "downcast1",
+    "curious": "curious1", "think": "thoughtful1", "thoughtful": "thoughtful1",
+    "greet": "welcoming1", "welcome": "welcoming1", "hello": "welcoming1",
+    "shake": "no1", "no": "no1",
+    "nod": "yes1", "yes": "yes1",
+    "surprised": "surprised1", "amazed": "amazed1",
+    "scared": "scared1", "fear": "fear1", "anxious": "anxiety1",
+    "proud": "proud1", "success": "success1", "victory": "success1",
+    "tired": "tired1", "exhausted": "exhausted1", "sleep": "sleep1",
+    "loving": "loving1", "love": "loving1", "grateful": "grateful1",
+    "confused": "confused1", "uncertain": "uncertain1",
+    "shy": "shy1", "embarrassed": "shy1",
+    "frustrated": "frustrated1", "angry": "rage1", "rage": "rage1",
+    "furious": "furious1", "annoyed": "irritated1", "irritated": "irritated1",
+    "displeased": "displeased1", "contempt": "contempt1",
+    "bored": "boredom1", "boredom": "boredom1",
+    "indifferent": "indifferent1", "uncomfortable": "uncomfortable1",
+    "relief": "relief1", "serenity": "serenity1", "calm": "calming1",
+    "enthusiastic": "enthusiastic1", "energetic": "enthusiastic1",
+    "attentive": "attentive1", "listening": "attentive1",
+    "helpful": "helpful1", "understand": "understanding1",
+    "inquiring": "inquiring1", "asking": "inquiring1",
+    "incomprehensible": "incomprehensible2", "lost": "lost1",
+    "oops": "oops1", "mistake": "oops1", "reprimand": "reprimand1",
+    "impatient": "impatient1", "resigned": "resigned1",
+    "go_away": "go_away1", "come": "come1",
+    "electric": "electric1", "dying": "dying1", "die": "dying1",
+}
+
+
 def _tool_play_emotion(name: str = "", **_kwargs) -> dict:
-    """Play a pre-baked emotion animation: happy | sad | curious | think | greet."""
-    name = (name or "").strip().lower()
-    ALLOWED = {"happy", "sad", "curious", "think", "greet", "shake", "nod"}
-    if name not in ALLOWED:
-        return {"error": f"unknown emotion {name!r}, valid: {sorted(ALLOWED)}"}
-    return _post_daemon(f"/api/move/play/{name}")
+    """Play a pre-recorded animation (emotion OR dance) from official HF libraries.
+
+    Routing (matches implementation order):
+      1. name in dances library (19 names: yeah_nod / chicken_peck / chin_lead / ...)
+         → play directly from pollen-robotics/reachy-mini-dances-library
+      2. name == "dance" / "dancing" / "boogie" / "groove" / "jig" → default dance "yeah_nod"
+      3. name matches an emotions-library clip exactly (e.g. dance3, cheerful2,
+         enthusiastic2, proud3, yes_sad1, oops2, understanding2)
+         → play directly from pollen-robotics/reachy-mini-emotions-library
+      4. name in alias map (happy / cheerful / sad / curious / proud / loving ...)
+         → translate to clip and play from emotions library
+      5. otherwise → error with hint of valid names
+
+    NOTE: clip playback speed is controlled by the recorded JSON timeline on the
+    daemon, NOT by this handler. The face tracker delta clamp in robot_brain.py
+    still protects against the racing-back-to-face side-effect after the clip
+    finishes — that was the only bit we could fix on the LLM side.
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return {"error": "empty emotion/dance name"}
+
+    dances   = _get_dance_names()
+    emotions = _get_emotion_clip_names()
+
+    # All four playback branches below schedule a baseline resync ~5 s after
+    # firing so the face tracker doesn't race back to its stale pre-clip
+    # baseline. See _schedule_face_baseline_resync for rationale.
+
+    # 1. Direct dance-library hit (dynamic — covers any name pollen publishes)
+    if n in dances:
+        ds = _urlparse.quote(_DANCES_LIB, safe="")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_dance:{n}")
+        return result
+
+    # 2. Generic "dance" intent → prefer "yeah_nod" (short + friendly default);
+    #    fall back to alphabetically-first available dance if yeah_nod is gone.
+    if n in {"dance", "dancing", "boogie", "groove", "jig"}:
+        pick = "yeah_nod" if "yeah_nod" in dances else (sorted(dances)[0] if dances else "yeah_nod")
+        ds = _urlparse.quote(_DANCES_LIB, safe="")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{pick}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_dance:{pick}")
+        return result
+
+    # 3. Direct emotion-library hit (dynamic — covers ALL clips, e.g. dance3,
+    #    enthusiastic2, proud3, yes_sad1, oops2, understanding2 — beyond aliases)
+    if n in emotions:
+        ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{n}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_emotion:{n}")
+        return result
+
+    # 4. English-friendly alias (LLM emits "happy" → cheerful1, etc.)
+    if n in _EMOTION_ALIAS:
+        clip = _EMOTION_ALIAS[n]
+        ds = _urlparse.quote(_EMOTIONS_LIB, safe="")
+        result = _post_daemon(f"/api/move/play/recorded-move-dataset/{ds}/{clip}")
+        if isinstance(result, dict) and result.get("ok"):
+            _schedule_face_baseline_resync(source=f"after_emotion:{clip}")
+        return result
+
+    # 5. Unknown — hint at available categories without dumping 100 names
+    hint_dances = sorted(list(dances))[:6] if dances else []
+    return {"error": f"unknown name {name!r}",
+            "hint_dances": hint_dances,
+            "hint_aliases": ["happy", "sad", "curious", "thoughtful", "greet",
+                             "nod", "shake", "surprised", "scared", "proud",
+                             "loving", "tired", "confused", "calm"]}
 
 
 def _tool_see_what(query: str = "", **_kwargs) -> dict:
@@ -369,18 +612,26 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
     ),
     "move_head": (
         _spec("move_head",
-              "Move the robot head to a pose in degrees. All axes optional, default 0. Safe range ±25°.",
+              "Move the robot head smoothly to a pose in degrees. All axes optional, default 0. Safe range ±25°.",
               {
-                  "pitch": {"type": "number", "description": "Head tilt up/down in degrees (+down)."},
-                  "yaw":   {"type": "number", "description": "Head turn left/right in degrees (+right)."},
-                  "roll":  {"type": "number", "description": "Head tilt sideways in degrees."},
+                  "pitch":    {"type": "number", "description": "Head tilt up/down in degrees (+down)."},
+                  "yaw":      {"type": "number", "description": "Head turn left/right in degrees (+right)."},
+                  "roll":     {"type": "number", "description": "Head tilt sideways in degrees."},
+                  "duration": {"type": "number", "description": "Optional seconds for the move. Floor of ~1.8s is enforced for safety; pass a larger value for a slower, more expressive motion (e.g. 3.0 for a deliberate look)."},
               }),
         _tool_move_head,
     ),
     "play_emotion": (
         _spec("play_emotion",
-              "Play an emotion animation. Choose from: happy, sad, curious, think, greet, shake, nod.",
-              {"name": {"type": "string", "description": "Emotion name."}},
+              "Play a pre-recorded animation: emotion OR dance. "
+              "Pass 'dance' for a generic dance, or any specific clip name from "
+              "the official pollen-robotics reachy-mini-{dances,emotions}-library "
+              "datasets (discovered dynamically from the daemon at runtime; "
+              "common aliases like happy/sad/curious/proud/loving/scared/tired/"
+              "confused/calm/welcome map to canonical emotion clips). "
+              "Examples — dances: yeah_nod, jackson_square, dizzy_spin, "
+              "groovy_sway_and_roll. Emotions: happy, sad, curious, surprised.",
+              {"name": {"type": "string", "description": "Animation name. Use 'dance' for a generic dance, or a specific clip name (dance or emotion). Unknown names return an error with hints."}},
               required=["name"]),
         _tool_play_emotion,
     ),
