@@ -9,6 +9,7 @@ Reachy Mini — 眼神追蹤 + 對話互動系統
 """
 import asyncio
 import enum
+import hashlib
 import io
 import json
 import os
@@ -68,6 +69,38 @@ TTS_VOICE        = TTS_VOICE_EN              # 預設值（被 pick_voice 覆寫
 
 TTS_VOICE_JA     = "ja-JP-NanamiNeural"     # 日文女聲
 TTS_VOICE_KO     = "ko-KR-SunHiNeural"      # 韓文女聲
+
+# HaGen v4 cloned voice (GPT-SoVITS v2Pro, trained on Breeze-25 ASR, 7538 chunks).
+# Hosted as FastAPI on 5090 (Tailscale). Only triggered when TTS_ENGINE=hagen.
+HAGEN_TTS_URL    = os.getenv("HAGEN_TTS_URL", "http://100.124.198.14:8011/tts")  # 5090 tailscale
+HAGEN_TTS_TIMEOUT_S = float(os.getenv("HAGEN_TTS_TIMEOUT_S", "20"))
+# Text normalize map — drop English brand/tech terms HaGen never said into
+# Chinese equivalents so v4 can stay in pure-Chinese phonemizer path (avoids
+# Mixed-mode 切多段 prosody collapse). Empirically validated in v4.2.
+HAGEN_NORMALIZE_MAP = {
+    # Robot / brand
+    "Reachy": "瑞奇", "reachy": "瑞奇", "REACHY": "瑞奇",
+    # Tech terms HaGen never said
+    "Whisper": "語音辨識", "whisper": "語音辨識",
+    "vLLM":   "語言模型",  "VLLM":   "語言模型",
+    "GPT-SoVITS": "語音合成", "gpt-sovits": "語音合成",
+    "Breeze": "聲音模型",
+    "Tailscale": "區網",
+    # Daily English nouns in Taiwan Mandarin → Chinese equivalents
+    "Costco": "好市多", "COSTCO": "好市多",
+    "milk":   "牛奶", "Milk": "牛奶", "MILK": "牛奶",
+    "weather":"天氣", "Weather": "天氣",
+    "Hello":  "你好", "hello": "你好",
+    "Hi":     "嗨",  "hi":   "嗨",
+    "actually": "其實",
+    "you know": "你知道",
+    "nice":   "不錯", "Nice": "不錯",
+    "OK":     "好", "ok": "好", "Ok": "好",
+    "latency":"延遲", "Latency": "延遲",
+    "machine":"機器", "Machine": "機器",
+    "installed":"安裝", "install": "安裝",
+    "yeah":   "對", "Yeah": "對",
+}
 
 
 def _script(c: str) -> str:
@@ -566,13 +599,156 @@ _EMOJI_RE = _re.compile(
 def _strip_emoji(text: str) -> str:
     return _EMOJI_RE.sub('', text).strip()
 
+
+# HaGen GPT decoder trained on chunks ~4-14s (≈ 20-30 chars per chunk).
+# RCA (v4.8/v4.9 with Breeze-ASR-25 verification):
+#   8 字  → 7% recall   (collapse)
+#   11-14 字 → ~33% recall (random hit)
+#   23+ 字 → ~80% recall (production-acceptable)
+# Plus heavy phrases that fit HaGen's gaming-streamer prior work better than thin filler.
+HAGEN_SHORT_PAD_THRESHOLD = 25
+HAGEN_PAD_PREFIXES = [
+    "我跟你說 ", "對啊 我覺得 ", "欸 我跟你說 ",
+    "誒我想想 ", "好 我跟你說 ",
+]
+HAGEN_PAD_SUFFIXES = [
+    " 你說對不對啊 我覺得真的是", " 是不是 我跟你說啊",
+    " 真的太好笑了啦 你說對不對", " 對吧 我跟你說 真的是",
+    " 啦 你想想看 真的是這樣",
+]
+import random as _hagen_rand
+
+
+def _pad_for_hagen(text: str) -> str:
+    """Pad short utterances to HaGen training-distribution length (≥ 25 chars).
+
+    Empirically: padding to 23+ chars + HaGen-natural filler phrases lifts
+    core-content recall from 7% (8-char baseline) to ~80% (23-char heavy pad).
+    """
+    if len(text) >= HAGEN_SHORT_PAD_THRESHOLD:
+        return text
+    prefix = _hagen_rand.choice(HAGEN_PAD_PREFIXES)
+    suffix = _hagen_rand.choice(HAGEN_PAD_SUFFIXES)
+    padded = prefix + text + suffix
+    # If a single round still falls short, double-pad
+    if len(padded) < HAGEN_SHORT_PAD_THRESHOLD:
+        padded = _hagen_rand.choice(HAGEN_PAD_PREFIXES) + padded
+    return padded
+
+
+def _normalize_for_tts_hagen(text: str) -> str:
+    """Pre-process LLM text for HaGen v4 TTS: ENG brand/tech terms → ZH equivalents.
+
+    Empirical reason: HaGen training data has zero occurrences of names like
+    Whisper / vLLM / Reachy; the AR decoder produces garbled audio for them.
+    Daily ENG nouns (milk, weather) trigger Mixed-mode multi-segment synthesis
+    that breaks prosody. Replacing them ahead keeps the whole sentence in
+    a single Chinese phonemizer pass.
+    """
+    for k, v in HAGEN_NORMALIZE_MAP.items():
+        text = text.replace(k, v)
+    # Drop residual lone Latin letters in CJK context that often come from
+    # acronyms (e.g. "v" left after "vLLM"→"語言模型" mapping failure).
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+async def _fetch_hagen_tts(text: str):
+    """Returns (samples, sr) or None on failure.
+
+    Calls the 5090-side FastAPI server (hagen_tts_server.py) which serves
+    GPT-SoVITS v4 inference with the locked production config:
+        text_language=Chinese, inp_refs=[3 emotive HaGen clips],
+        sample_steps=16, speed=1.0, pause_second=0.3.
+    """
+    normalized = _normalize_for_tts_hagen(text)
+    if normalized != text:
+        print(f"  [HaGen normalize] {text!r} -> {normalized!r}")
+    # Short text needs padding (RCA: GPT EOS bias on training chunk-length prior)
+    padded = _pad_for_hagen(normalized)
+    if padded != normalized:
+        print(f"  [HaGen pad] {normalized!r} -> {padded!r}")
+    normalized = padded
+    cache_key = hashlib.md5(("hagen|" + normalized).encode("utf-8")).hexdigest()
+    cache_path = TTS_CACHE_DIR / f"hagen_{cache_key}.wav"
+    if cache_path.exists():
+        try:
+            data, sr = sf.read(str(cache_path), dtype="float32")
+            try:
+                os.utime(str(cache_path), None)
+            except Exception:
+                pass
+            _tts_cache_stats["hit"] += 1
+            print(f"  [TTS HaGen CACHE] {cache_path.stat().st_size}B <{len(normalized)} chars>")
+            _tts_cache_report_maybe()
+            return data, sr
+        except Exception as e:
+            print(f"  [TTS HaGen cache read fail] {e}")
+    try:
+        import aiohttp
+        t0 = time.perf_counter()
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=HAGEN_TTS_TIMEOUT_S)
+        ) as sess:
+            async with sess.post(
+                HAGEN_TTS_URL,
+                json={"text": normalized},
+            ) as resp:
+                if resp.status != 200:
+                    body = (await resp.read())[:200]
+                    print(f"  [TTS HaGen 失敗] status={resp.status} body={body!r}")
+                    return None
+                body = await resp.read()
+        print(f"  [TTS HaGen] {(time.perf_counter()-t0)*1000:.0f}ms <{len(normalized)} chars, {len(body)}B>")
+        data, sr = sf.read(io.BytesIO(body), dtype="float32")
+    except Exception as e:
+        print(f"  [TTS HaGen 失敗] {type(e).__name__}: {e}，fallback")
+        return None
+    try:
+        sf.write(str(cache_path), data, sr, format="WAV")
+        _tts_cache_evict_if_needed()
+    except Exception as e:
+        print(f"  [TTS HaGen cache write fail] {e}")
+    _tts_cache_stats["miss"] += 1
+    _tts_cache_report_maybe()
+    return data, sr
+
+
 async def _stream_tts(text: str, mini) -> None:
     text = _strip_emoji(text)   # ← 念出來前把 emoji 去掉（Kokoro 會念成 "smiling face"）
     if not text:
         return
-    # TTS 引擎：edge = Microsoft 雲端 Ana（可愛童音），kokoro = GPU 本地
+    # TTS 引擎選擇：
+    #   hagen  = HaGen v4 cloned voice (GPT-SoVITS on 5090, ZH-only normalized path)
+    #   edge   = Microsoft 雲端 Ana / HsiaoYu / etc. (multilingual)
+    #   kokoro = GPU 本地 (Kokoro 82M)
     engine = os.getenv("TTS_ENGINE", "kokoro").lower()
-    if engine == "edge":
+    if engine == "hagen":
+        # HaGen v4 RCA verdict: content-prior mismatch on formal/intro short text
+        # (HaGen is gaming streamer — never said "嗨我是 X" in training data).
+        # Empirical thresholds:
+        #   raw text < 12 chars OR contains 自介/系統 phrases → use Edge (100% stable)
+        #   else → HaGen v4 (with normalize + padding)
+        HAGEN_MIN_LEN = int(os.getenv("HAGEN_MIN_LEN", "12"))
+        HAGEN_EDGE_INTRO_PATTERNS = re.compile(
+            r"(嗨我是|你好我是|我是瑞奇|hello.{0,20}reachy|hi[\s,.]+(i'?m|i am|my name).{0,15}reachy|^好的$|^好喔$|^是$|^對$|^不是$|^OK$|^好$)",
+            re.IGNORECASE,
+        )
+        force_edge = (
+            len(text.strip()) < HAGEN_MIN_LEN
+            or bool(HAGEN_EDGE_INTRO_PATTERNS.search(text))
+        )
+        if force_edge:
+            print(f"  [TTS hybrid] short/intro → Edge: {text!r}")
+            result = await _fetch_edge_tts(text)
+            if result is None:
+                result = await _fetch_hagen_tts(text)
+        else:
+            result = await _fetch_hagen_tts(text)
+            if result is None:
+                print("  [TTS] HaGen 失敗，fallback edge")
+                result = await _fetch_edge_tts(text)
+    elif engine == "edge":
         result = await _fetch_edge_tts(text)
         if result is None:
             result = _fetch_kokoro_tts(text)
