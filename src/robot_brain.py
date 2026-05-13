@@ -47,8 +47,13 @@ from mediapipe.tasks.python.vision import (
 cv2.setNumThreads(max(1, (os.cpu_count() or 8)))
 
 # ── utf-8 輸出 ────────────────────────────────────────────────────────────────
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+# Reconfigure in-place to avoid leaving the original TextIOWrapper unreferenced —
+# its GC'd __del__ closes the shared underlying buffer, which breaks every
+# thread's print() across the process (manifests as "ValueError: I/O operation
+# on closed file" minutes-to-hours after startup, typically correlated with
+# GStreamer pipeline teardown / WebRTC reconnect events).
+sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 HOST             = os.getenv("REACHY_HOST", "reachy-mini.local")   # mDNS by default; override via env
