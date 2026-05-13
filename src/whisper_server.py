@@ -55,7 +55,7 @@ async def transcribe(req: Request):
             data = scipy.signal.resample(data, int(len(data) * 16000 / sr)).astype(np.float32)
         audio_s = len(data) / 16000
         segs, _ = model.transcribe(
-            data, language="en", beam_size=3, vad_filter=True,
+            data, language=None, beam_size=3, vad_filter=True,
             condition_on_previous_text=False,
         )
         text = "".join(s.text for s in segs).strip()
