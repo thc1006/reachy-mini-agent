@@ -55,6 +55,24 @@ cv2.setNumThreads(max(1, (os.cpu_count() or 8)))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
+# ── systemd watchdog (Type=notify + WatchdogSec=120s) ─────────────────────────
+# sdnotify.SystemdNotifier() is a no-op when NOTIFY_SOCKET is unset (i.e. running
+# outside systemd or under a non-notify unit), so dev runs are unaffected. The
+# production unit uses Type=notify with WatchdogSec=120s; main() sends READY=1
+# after threads are up and WATCHDOG=1 every 30s from the idle loop.
+try:
+    import sdnotify
+    _sd_notifier = sdnotify.SystemdNotifier()
+except ImportError:
+    _sd_notifier = None
+
+def _sd_notify(state: str) -> None:
+    if _sd_notifier is not None:
+        try:
+            _sd_notifier.notify(state)
+        except Exception:
+            pass
+
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 HOST             = os.getenv("REACHY_HOST", "reachy-mini.local")   # mDNS by default; override via env
 SAMPLE_RATE      = 16000
@@ -2611,10 +2629,15 @@ def main():
         print("\n── 等待有人靠近（Ctrl+C 結束）──")
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")
+        _sd_notify("READY=1")
 
         try:
+            last_watchdog = time.monotonic()
             while True:
                 time.sleep(0.5)
+                if time.monotonic() - last_watchdog >= 30.0:
+                    _sd_notify("WATCHDOG=1")
+                    last_watchdog = time.monotonic()
         except KeyboardInterrupt:
             print("\n關閉中...")
         finally:

@@ -1,20 +1,24 @@
 [Unit]
-Description=Reachy Mini brain (LLM + STT + TTS orchestrator on DGX Spark)
-After=network-online.target whisper-server.service
-Wants=network-online.target whisper-server.service
-# Ollama is a system-level service (not user-level), so we just rely on
-# its HTTP endpoint at :11434 being up. robot_brain retries internally.
+Description=Reachy Mini Robot Brain
+After=network-online.target kokoro.service whisper.service
+Wants=network-online.target
 
 [Service]
-Type=simple
-WorkingDirectory=%h/dev/reachy-agent
-ExecStart=/bin/bash %h/dev/reachy-agent/scripts/run_robot_spark.sh
+# Patch #2 (2026-05-16): Type=notify + WatchdogSec=120s. robot_brain.py sends
+# READY=1 after threads are up, then WATCHDOG=1 every 30s from the idle loop.
+# If the main thread blocks or the python process deadlocks, watchdog timeout
+# kicks Restart=on-failure. This complements the log-silent watchdog timer
+# (commit 5daaf8f) — sd_notify catches in-process deadlocks the log watcher
+# would miss (e.g. when print() keeps running but main loop is stuck).
+Type=notify
+TimeoutStartSec=180
+WatchdogSec=120
+WorkingDirectory=/home/reachym/dev/reachy-agent/robot
+ExecStart=/home/reachym/dev/reachy-agent/robot/run_robot.sh
 Restart=on-failure
 RestartSec=10
-# robot_brain has its own threads + WebRTC stack; give it plenty of FD budget
-LimitNOFILE=65536
-StandardOutput=append:%h/logs/robot-brain.log
-StandardError=append:%h/logs/robot-brain.log
+StandardOutput=append:/home/reachym/dev/reachy-agent/robot/logs/robot_brain.log
+StandardError=inherit
 
 [Install]
 WantedBy=default.target
