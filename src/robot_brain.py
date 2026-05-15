@@ -2526,9 +2526,45 @@ def _prewarm_vllm():
         print(f"  [vLLM prewarm err] {e}")
 
 
+def _patch_sdk_signalling_host():
+    """SDK 1.7.x bug: ReachyMini._configure_mediamanager uses
+    `signalling_host=daemon_status.wlan_ip or "localhost"`, where wlan_ip is
+    the robot's LOCAL Wi-Fi IP (e.g. 192.168.50.85). When robot-brain runs
+    on a separate compute box that reaches the robot over Tailscale or a
+    different LAN, that wlan_ip is unrouteable and the WebRTC signalling
+    WebSocket times out at boot. Patch MediaManager.__init__ to force the
+    signalling host back to HOST (the host we explicitly told ReachyMini to
+    connect to, which IS the routeable address by construction).
+
+    Insert before any ReachyMini() instantiation. Idempotent.
+    """
+    try:
+        from reachy_mini.media import media_manager as _mm
+    except Exception as e:
+        print(f"  [SDK patch] cannot import media_manager: {e}", flush=True)
+        return
+    if getattr(_mm.MediaManager.__init__, "_thc_patched", False):
+        return
+    _orig = _mm.MediaManager.__init__
+
+    def _patched(self, *args, **kwargs):
+        old = kwargs.get("signalling_host")
+        kwargs["signalling_host"] = HOST
+        if old and old != HOST:
+            print(f"  [SDK patch] signalling_host override: {old} → {HOST}",
+                  flush=True)
+        return _orig(self, *args, **kwargs)
+
+    _patched._thc_patched = True
+    _mm.MediaManager.__init__ = _patched
+    print(f"  [SDK patch] MediaManager.signalling_host pinned to {HOST}",
+          flush=True)
+
+
 def main():
     _load_conv_memory()   # ← 啟動時載入 JSONL 歷史
     _prewarm_vllm()       # ← prime vLLM prefix cache before first user turn
+    _patch_sdk_signalling_host()
     print(f"連線到 Reachy Mini ({HOST})...")
     with ReachyMini(host=HOST, port=8000, connection_mode="network", media_backend="default") as mini:
         print("連線成功！\n")
