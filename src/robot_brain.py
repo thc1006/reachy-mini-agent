@@ -137,6 +137,29 @@ def _parse_face_track_max_abs_deg() -> float:
 FACE_TRACK_MAX_ABS_DEG = _parse_face_track_max_abs_deg()
 
 
+# Motor state cache (1 Hz polled by motor_state_poll_loop). Used by
+# face_tracker to gate set_target — the daemon stores set_target as its
+# "desired pose" even when motor torque is OFF, so sending face-driven
+# absolute targets while motors are disabled pollutes the daemon's target
+# state. On the next motor enable, the daemon snaps to that polluted target
+# at full speed (no minjerk, no duration). That snap was the cause of the
+# 2026-05-15 "scary fast" incident on motor enable.
+#
+# The poll thread additionally re-syncs face_tracker baseline from daemon
+# real pose on every disabled→enabled transition, so the first frame after
+# enable starts from a correct reference.
+#
+# Default "unknown" is intentionally fail-safe: until the poll thread has
+# fetched at least once, face_tracker holds off on set_target.
+_motor_state = "unknown"   # "enabled" | "disabled" | "unknown"
+_motor_state_lock = threading.Lock()
+
+
+def _get_motor_state() -> str:
+    with _motor_state_lock:
+        return _motor_state
+
+
 def note_head_command(pitch_deg: float | None = None,
                       yaw_deg: float | None = None,
                       body_yaw_rad: float | None = None,
@@ -191,6 +214,50 @@ def _clamp_pose_delta(target_pitch_deg: float, target_yaw_deg: float) -> tuple[f
     y = max(-max_abs, min(max_abs, y))
     clamped = (abs(p - target_pitch_deg) > 1e-6) or (abs(y - target_yaw_deg) > 1e-6)
     return p, y, clamped
+
+
+def motor_state_poll_loop(stop_event: threading.Event):
+    """Poll daemon /api/motors/status every 1 s, cache the current mode in
+    `_motor_state`. On any disabled→enabled transition, re-sync the
+    face_tracker baseline (`_last_cmd_pitch/yaw_deg`) from daemon's real
+    pose so the first frame after enable doesn't send a stale absolute
+    target.
+    """
+    import urllib.request as _ureq
+    global _motor_state
+    prev = "unknown"
+    print("  [馬達狀態 poll] 啟動", flush=True)
+    while not stop_event.is_set():
+        try:
+            with _ureq.urlopen(f"http://{HOST}:8000/api/motors/status", timeout=2) as r:
+                cur = (json.loads(r.read()).get("mode") or "unknown").lower()
+            with _motor_state_lock:
+                _motor_state = cur
+            if prev != "enabled" and cur == "enabled":
+                try:
+                    with _ureq.urlopen(
+                        f"http://{HOST}:8000/api/state/present_head_pose", timeout=2
+                    ) as r:
+                        pose = json.loads(r.read())
+                    p0 = float(np.rad2deg(pose.get("pitch", 0.0)))
+                    y0 = float(np.rad2deg(pose.get("yaw", 0.0)))
+                    note_head_command(
+                        pitch_deg=p0, yaw_deg=y0, body_yaw_rad=0.0,
+                        source="motor_enable_resync",
+                    )
+                    print(
+                        f"  [追蹤 motor-enable resync] daemon pitch={p0:+.1f}° "
+                        f"yaw={y0:+.1f}°",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"  [追蹤 motor-enable resync 失敗] {e}", flush=True)
+            prev = cur
+        except Exception:
+            with _motor_state_lock:
+                _motor_state = "unknown"
+        time.sleep(1.0)
+
 
 TTS_VOICE_EN     = "en-US-AnaNeural"        # 可愛小女孩英文聲
 TTS_VOICE_ZH     = "zh-TW-HsiaoYuNeural"    # 可愛台灣女生中文聲
@@ -2271,7 +2338,17 @@ def tracking_loop(mini, stop_event: threading.Event):
             # 同步的、所以這層 clamp 限制每幀變化 ≤ FACE_TRACK_MAX_DELTA_DEG。
             # 1.5°/frame × 30 FPS = 45°/sec 上限、不嚇人、追蹤仍夠快。
             pitch_capped, yaw_capped, clamp_hit = _clamp_pose_delta(head_pitch_deg, head_yaw_deg)
-            lock_ok = _motion_lock.acquire(blocking=False)
+            # Motor gate: do NOT send set_target unless motors are confirmed
+            # enabled. daemon stores set_target as the "desired pose" even
+            # when torque is OFF; on the next motor enable, daemon snaps to
+            # that stored target at full speed (no minjerk). Skipping
+            # set_target when motors are disabled keeps daemon's stored
+            # target at whatever was last commanded by an explicit goto
+            # (which is always a smooth, safe pose like neutral or wake_up).
+            if _get_motor_state() != "enabled":
+                lock_ok = False  # skip set_target entirely below
+            else:
+                lock_ok = _motion_lock.acquire(blocking=False)
             if lock_ok:
                 try:
                     try:
@@ -2460,6 +2537,10 @@ def main():
         tracker    = threading.Thread(target=tracking_loop, args=(mini, stop_event), daemon=True)
         hands      = threading.Thread(target=hand_worker, args=(mini, stop_event), daemon=True)
         vision     = threading.Thread(target=vision_worker, args=(stop_event,), daemon=True)
+        motor_st   = threading.Thread(target=motor_state_poll_loop, args=(stop_event,), daemon=True)
+        # Start motor-state poll FIRST so face_tracker has a non-"unknown"
+        # reading by the time its first frame fires (1 s poll interval).
+        motor_st.start()
         tracker.start()
         hands.start()
         vision.start()
