@@ -109,6 +109,34 @@ def _parse_face_track_max_delta_deg() -> float:
 FACE_TRACK_MAX_DELTA_DEG = _parse_face_track_max_delta_deg()
 
 
+def _parse_face_track_max_abs_deg() -> float:
+    """Parse FACE_TRACK_MAX_ABS_DEG env, sanitize to safe range.
+
+    Absolute hard cap that backs up the per-frame delta clamp. The delta clamp
+    only protects against fast motion *given a correct baseline state*; if the
+    baseline is wrong (e.g. process restart before daemon-pose sync, or unit
+    confusion between deg and rad somewhere), the delta clamp can still send
+    the head to dangerous absolute angles. This ABS cap ensures the head can
+    never be commanded outside [-N, +N] degrees from neutral, regardless of
+    baseline state.
+
+    The face tracker normally outputs head_pitch/yaw in [-20, +25] degrees
+    (see tracking_loop clip), so a 30° cap is comfortably permissive in
+    normal operation and only kicks in on bug paths.
+    """
+    raw = os.getenv("FACE_TRACK_MAX_ABS_DEG", "30")
+    try:
+        v = float(raw)
+    except (ValueError, TypeError):
+        return 30.0
+    if v != v:
+        return 30.0
+    return max(1.0, min(60.0, v))
+
+
+FACE_TRACK_MAX_ABS_DEG = _parse_face_track_max_abs_deg()
+
+
 def note_head_command(pitch_deg: float | None = None,
                       yaw_deg: float | None = None,
                       body_yaw_rad: float | None = None,
@@ -137,15 +165,30 @@ def note_head_command(pitch_deg: float | None = None,
 
 
 def _clamp_pose_delta(target_pitch_deg: float, target_yaw_deg: float) -> tuple[float, float, bool]:
-    """Clamp target pose to within FACE_TRACK_MAX_DELTA_DEG of last commanded.
+    """Clamp target pose to within FACE_TRACK_MAX_DELTA_DEG of last commanded
+    AND within ±FACE_TRACK_MAX_ABS_DEG absolute. Two-layer defense:
+
+      1. Per-frame delta cap → smooth motion when baseline is correct.
+      2. Absolute cap → safety net when baseline is stale or corrupted
+         (e.g. process restart before tracker startup-sync, unit-confusion
+         between rad and deg, race conditions). The head can NEVER be
+         commanded outside the absolute range, regardless of how broken
+         the upstream state is.
+
     Returns (clamped_pitch, clamped_yaw, was_clamped). Read-only — caller
-    must note_head_command() after the actual set_target succeeds."""
+    must note_head_command() after the actual set_target succeeds.
+    """
     max_d = FACE_TRACK_MAX_DELTA_DEG
+    max_abs = FACE_TRACK_MAX_ABS_DEG
     with _cmd_state_lock:
         last_p = _last_cmd_pitch_deg
         last_y = _last_cmd_yaw_deg
+    # Layer 1: delta cap relative to last commanded
     p = max(last_p - max_d, min(last_p + max_d, target_pitch_deg))
     y = max(last_y - max_d, min(last_y + max_d, target_yaw_deg))
+    # Layer 2: absolute cap regardless of last commanded
+    p = max(-max_abs, min(max_abs, p))
+    y = max(-max_abs, min(max_abs, y))
     clamped = (abs(p - target_pitch_deg) > 1e-6) or (abs(y - target_yaw_deg) > 1e-6)
     return p, y, clamped
 
@@ -2143,6 +2186,27 @@ def tracking_loop(mini, stop_event: threading.Event):
     face_lost_count = 0
     FACE_LOST_TOL   = 10   # 0.2s 容忍（@0.02s/frame）
     _size_set = False
+
+    # Sync face_tracker baseline from daemon's real pose at startup. Without
+    # this, _last_cmd_pitch/yaw are 0.0 by default while the daemon's actual
+    # pose may be anywhere (e.g. user just moved head via /api/move/goto,
+    # or motors are torque-OFF and head is hanging at +16°). First frame's
+    # set_target would otherwise jump from 0° baseline to a daemon-actual
+    # delta, triggering a fast scary motion. With this sync, the clamp is
+    # immediately useful and motion is smooth from frame one.
+    try:
+        import urllib.request as _ureq_sync
+        with _ureq_sync.urlopen(f"http://{HOST}:8000/api/state/present_head_pose",
+                                timeout=2) as _r:
+            _pose = json.loads(_r.read())
+        _p0 = float(np.rad2deg(_pose.get("pitch", 0.0)))
+        _y0 = float(np.rad2deg(_pose.get("yaw", 0.0)))
+        note_head_command(pitch_deg=_p0, yaw_deg=_y0, body_yaw_rad=0.0,
+                          source="tracking_loop_startup_sync")
+        print(f"  [追蹤 baseline sync] daemon pitch={_p0:+.1f}° yaw={_y0:+.1f}°",
+              flush=True)
+    except Exception as _e:
+        print(f"  [追蹤 baseline sync 失敗、用 0/0] {_e}", flush=True)
 
     print("  [追蹤] 啟動")
     while not stop_event.is_set():
