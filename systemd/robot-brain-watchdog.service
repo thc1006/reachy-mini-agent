@@ -1,0 +1,12 @@
+[Unit]
+Description=Watchdog: restart robot-brain.service if its log goes silent (WebRTC stall recovery)
+After=robot-brain.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/reachym/dev/reachy-agent/robot/scripts/robot_brain_watchdog.sh
+# stdout/stderr land in journal --user; query with:
+#   journalctl --user -u robot-brain-watchdog.service -n 20
+
+[Install]
+WantedBy=default.target

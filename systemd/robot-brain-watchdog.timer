@@ -1,0 +1,14 @@
+[Unit]
+Description=Run robot-brain-watchdog every minute
+
+[Timer]
+# First run 60s after boot/timer-start, then every 60s. Slight randomization
+# avoids exact-second clock alignment with other periodic work.
+OnBootSec=60s
+OnUnitActiveSec=60s
+RandomizedDelaySec=5s
+AccuracySec=1s
+Unit=robot-brain-watchdog.service
+
+[Install]
+WantedBy=timers.target
