@@ -20,7 +20,7 @@ export VISION_MODEL=qwen3.6:35b-a3b   # unify: same MoE serves both dialog and V
 export LLM_STREAMING=1                # sentence-by-sentence streaming → faster first-audio
 export LLM_TOOLS=1                    # enable tool-calling (works for both vLLM + Ollama backends)
 export TTS_ENGINE=edge
-export TTS_GAIN=0.05
+export TTS_GAIN=0.20
 # Lock to "Google 小姐" zh-TW female voice for all output (including English
 # fragments — Chinese-accented English is preferred over voice switching
 # mid-conversation). Unset (or set empty) to fall back to pick_voice() auto-routing.

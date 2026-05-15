@@ -2254,6 +2254,19 @@ def tracking_loop(mini, stop_event: threading.Event):
     FACE_LOST_TOL   = 10   # 0.2s 容忍（@0.02s/frame）
     _size_set = False
 
+    # Lost-connection counter — SDK 1.7.3 has no auto-reconnect path
+    # (WSClient._check_alive is passive heartbeat only, confirmed via
+    # source inspection). When daemon WebSocket dies, every subsequent
+    # send_command raises ConnectionError("Lost connection with the server.")
+    # and the loop would otherwise spin emitting identical errors until
+    # manual intervention. After LOST_CONN_LIMIT consecutive Lost-connection
+    # exceptions we os._exit(2) so systemd Restart=on-failure brings the
+    # service back clean (Plan A startup baseline sync + Plan C motor-state
+    # poll re-initialize correctly on restart). 3 × ~0.03 s per tracking
+    # iter = ~0.1 s detection vs the previous unbounded spin.
+    LOST_CONN_LIMIT = 3
+    lost_conn_count = 0
+
     # Sync face_tracker baseline from daemon's real pose at startup. Without
     # this, _last_cmd_pitch/yaw are 0.0 by default while the daemon's actual
     # pose may be anywhere (e.g. user just moved head via /api/move/goto,
@@ -2366,8 +2379,21 @@ def tracking_loop(mini, stop_event: threading.Event):
                     )
                     note_head_command(pitch_deg=pitch_capped, yaw_deg=yaw_capped,
                                       body_yaw_rad=body_yaw_rad, source="face_tracker")
+                    lost_conn_count = 0   # successful frame → reset counter
                 except Exception as e:
                     print(f"  [追蹤錯誤] {e}", flush=True)
+                    if "Lost connection" in str(e):
+                        lost_conn_count += 1
+                        if lost_conn_count >= LOST_CONN_LIMIT:
+                            print(
+                                f"  [追蹤] {lost_conn_count} 次 Lost-connection、"
+                                "exit 讓 systemd Restart=on-failure 重啟",
+                                flush=True,
+                            )
+                            stop_event.set()
+                            os._exit(2)   # skip cleanup that uses dead socket
+                    else:
+                        lost_conn_count = 0   # different error → reset
                 finally:
                     _motion_lock.release()
 
