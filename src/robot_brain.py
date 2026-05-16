@@ -2615,6 +2615,28 @@ def main():
     with ReachyMini(host=HOST, port=8000, connection_mode="network", media_backend="default") as mini:
         print("連線成功！\n")
 
+        # ── Soft head-lift before face_tracker takes over ──
+        # If the head was gravity-settled while motors were disabled (e.g. after
+        # an extended sleep / overnight idle), it droops to pitch ~+25°. Once
+        # motors enable, daemon won't move the head until an SDK client (this
+        # process) is connected, and once we ARE connected the tracking_loop's
+        # baseline_sync would pin face_tracker's target at the drooped pose.
+        # Lift to neutral here, BEFORE the trackers start, so the new baseline
+        # reads neutral. 5 s minjerk is slow enough not to startle a nearby
+        # person and reads as a deliberate "waking up" gesture.
+        try:
+            print("  [startup] soft head-lift to neutral (5s)...", flush=True)
+            mini.goto_target(
+                head=create_head_pose(z=0, mm=True),
+                antennas=np.deg2rad([0, 0]),
+                body_yaw=np.deg2rad(0),
+                duration=5.0,
+                method="minjerk",
+            )
+            time.sleep(5.2)
+        except Exception as e:
+            print(f"  [startup] head-lift skipped: {e}", flush=True)
+
         stop_event = threading.Event()
         tracker    = threading.Thread(target=tracking_loop, args=(mini, stop_event), daemon=True)
         hands      = threading.Thread(target=hand_worker, args=(mini, stop_event), daemon=True)
