@@ -2615,6 +2615,26 @@ def main():
     with ReachyMini(host=HOST, port=8000, connection_mode="network", media_backend="default") as mini:
         print("連線成功！\n")
 
+        # ── Motor controller wake sequence ──
+        # The wireless daemon ships with launcher.sh hardcoded to pass
+        # `--no-wake-up-on-start`, leaving the motor controller in a
+        # half-initialized "passive" state where `backend_status.ready` stays
+        # False, `last_alive` stays None, and every motor command is accepted
+        # by the daemon but never executed (verified 2026-05-17, see
+        # project_wireless_motor_wake_research). enable_gravity_compensation()
+        # + wake_up() complete the missing init steps from the client side.
+        # wake_up() also plays a short greeting emote + sound (intentional
+        # friendly gesture, audible at daemon volume so already calibrated low).
+        try:
+            print("  [startup] enable_gravity_compensation()...", flush=True)
+            mini.enable_gravity_compensation()
+            print("  [startup] wake_up() (gentle emote + sound)...", flush=True)
+            mini.wake_up()
+            time.sleep(2.5)   # wake_up emote runs ~2s; let it complete before next move
+            print("  [startup] wake sequence complete", flush=True)
+        except Exception as e:
+            print(f"  [startup] wake sequence skipped: {e}", flush=True)
+
         # ── Soft head-lift before face_tracker takes over ──
         # If the head was gravity-settled while motors were disabled (e.g. after
         # an extended sleep / overnight idle), it droops to pitch ~+25°. Once
