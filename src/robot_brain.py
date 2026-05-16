@@ -332,6 +332,36 @@ def _has_chinese(text: str) -> bool:
     return any(_script(c) == "han" for c in text)
 
 
+# OpenCC simplified→traditional converter (lazy, optional).
+# Whisper (production STT) outputs zh-CN simplified ~50% of the time for
+# zh-TW input — empirically measured 2026-05-17 (raw CER 0.200 of which
+# 0.102 was orthographic noise removed by OpenCC s2t normalization).
+# Gemini Live conversational output ALSO returns zh-CN simplified despite
+# zh-TW input. Wrapping STT result and TTS input through to_zh_tw() makes
+# both the console transcript ("你說：…") and the speech output text
+# consistently traditional. The audio pronunciation of Edge zh-TW voice is
+# unchanged either way (same syllables) — this is purely a display/log fix.
+try:
+    from opencc import OpenCC as _OpenCC
+    _opencc_s2t = _OpenCC("s2t")
+    print("  [opencc] s2t converter ready", flush=True)
+except Exception as _opencc_err:
+    _opencc_s2t = None
+    print(f"  [opencc] disabled ({_opencc_err.__class__.__name__})", flush=True)
+
+
+def to_zh_tw(text: str) -> str:
+    """Idempotent: traditional → traditional, simplified → traditional, non-zh → unchanged."""
+    if not text or _opencc_s2t is None:
+        return text
+    if not _has_chinese(text):
+        return text
+    try:
+        return _opencc_s2t.convert(text)
+    except Exception:
+        return text
+
+
 def pick_voice(text: str) -> str:
     """Pick TTS voice by dominant non-ASCII script.
 
@@ -945,6 +975,7 @@ async def _fetch_hagen_tts(text: str):
 
 async def _stream_tts(text: str, mini) -> None:
     text = _strip_emoji(text)   # ← 念出來前把 emoji 去掉（Kokoro 會念成 "smiling face"）
+    text = to_zh_tw(text)       # ← LLM 可能回簡體；normalize 到 zh-TW for consistent display + log
     if not text:
         return
     # TTS 引擎選擇：
@@ -1253,7 +1284,9 @@ def transcribe(audio: np.ndarray) -> str:
         text = _transcribe_via_5090(audio)
         if text is None:
             text = _transcribe_local(audio)
-        return text
+        # Normalize Whisper's zh-CN-leaning output back to zh-TW for display +
+        # downstream logging consistency. Idempotent for already-traditional text.
+        return to_zh_tw(text)
 
 # ── LLM（Claude CLI）─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
