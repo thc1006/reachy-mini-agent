@@ -2615,47 +2615,15 @@ def main():
     with ReachyMini(host=HOST, port=8000, connection_mode="network", media_backend="default") as mini:
         print("連線成功！\n")
 
-        # ── Motor controller wake sequence ──
-        # The wireless daemon ships with launcher.sh hardcoded to pass
-        # `--no-wake-up-on-start`, leaving the motor controller in a
-        # half-initialized "passive" state where `backend_status.ready` stays
-        # False, `last_alive` stays None, and every motor command is accepted
-        # by the daemon but never executed (verified 2026-05-17, see
-        # project_wireless_motor_wake_research). enable_gravity_compensation()
-        # + wake_up() complete the missing init steps from the client side.
-        # wake_up() also plays a short greeting emote + sound (intentional
-        # friendly gesture, audible at daemon volume so already calibrated low).
-        try:
-            print("  [startup] enable_gravity_compensation()...", flush=True)
-            mini.enable_gravity_compensation()
-            print("  [startup] wake_up() (gentle emote + sound)...", flush=True)
-            mini.wake_up()
-            time.sleep(2.5)   # wake_up emote runs ~2s; let it complete before next move
-            print("  [startup] wake sequence complete", flush=True)
-        except Exception as e:
-            print(f"  [startup] wake sequence skipped: {e}", flush=True)
-
-        # ── Soft head-lift before face_tracker takes over ──
-        # If the head was gravity-settled while motors were disabled (e.g. after
-        # an extended sleep / overnight idle), it droops to pitch ~+25°. Once
-        # motors enable, daemon won't move the head until an SDK client (this
-        # process) is connected, and once we ARE connected the tracking_loop's
-        # baseline_sync would pin face_tracker's target at the drooped pose.
-        # Lift to neutral here, BEFORE the trackers start, so the new baseline
-        # reads neutral. 5 s minjerk is slow enough not to startle a nearby
-        # person and reads as a deliberate "waking up" gesture.
-        try:
-            print("  [startup] soft head-lift to neutral (5s)...", flush=True)
-            mini.goto_target(
-                head=create_head_pose(z=0, mm=True),
-                antennas=np.deg2rad([0, 0]),
-                body_yaw=np.deg2rad(0),
-                duration=5.0,
-                method="minjerk",
-            )
-            time.sleep(5.2)
-        except Exception as e:
-            print(f"  [startup] head-lift skipped: {e}", flush=True)
+        # Note: brain previously added enable_gravity_compensation() + soft
+        # goto_target(neutral) at this point, intended for cold starts where
+        # the head had drooped under gravity while motors were disabled. Those
+        # calls turned out to be incompatible with `--wake-up-on-start` daemons:
+        # they timed out / triggered "Lost connection" cascades. Since the
+        # daemon now wakes itself on boot (systemd drop-in passes
+        # --wake-up-on-start, see project_wireless_motor_wake_research_2026_05_17),
+        # the brain does not need to do anything here — the head is already
+        # at neutral by the time we connect.
 
         stop_event = threading.Event()
         tracker    = threading.Thread(target=tracking_loop, args=(mini, stop_event), daemon=True)
