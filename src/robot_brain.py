@@ -494,10 +494,15 @@ _scene_desc   = ""
 _scene_desc_t = 0.0
 _scene_lock   = threading.Lock()
 
-# Shared lock so the vision worker and any other background Ollama caller can
-# see whether a main-dialog LLM call is currently in flight. Non-blocking:
-# background callers do best-effort acquire and skip this cycle if contended.
-_llm_inflight_lock = threading.Lock()
+# Dialog priority signal: set while a main-dialog LLM call is in flight, so
+# background callers (vision_worker) can yield bandwidth. Replaces an earlier
+# threading.Lock() that, due to acquire ordering, ended up *blocking dialog*
+# on a mid-VL vision call (the opposite of intent — see git log for the
+# audit). The lock predated the vLLM migration; vLLM continuous-batching
+# handles concurrent requests with ~4% overhead (validated, see vision_worker
+# comment), so the pessimistic client-side mutex was both unnecessary and
+# user-visible-harmful (dialog TTFB spiked to 3-15s when vision was mid-call).
+_llm_dialog_active = threading.Event()
 
 def vision_worker(stop_event: threading.Event):
     import urllib.request as _vreq
@@ -521,10 +526,12 @@ def vision_worker(stop_event: threading.Event):
         frame_ref = _latest_frame
         if frame_ref is None or time.time() - _latest_frame_t > 1.0:
             continue
-        # Back off when a foreground dialog LLM call is in flight — qwen3.6 is
-        # the same endpoint for both paths, so parallel calls queue and the VL
-        # one (20s timeout) can easily time out.
-        if not _llm_inflight_lock.acquire(timeout=0.2):
+        # Yield to user-facing dialog: skip this 30s cycle if a dialog LLM
+        # call is currently in flight. scene_desc has 60s TTL so missing one
+        # cycle is harmless. Critically, we no longer *block* dialog — vLLM's
+        # continuous-batching handles concurrent VL+dialog with ~4% overhead.
+        if _llm_dialog_active.is_set():
+            print("  [視覺 worker] dialog active — skip cycle", flush=True)
             continue
         try:
             ok, jpg = cv2.imencode(".jpg", frame_ref, [cv2.IMWRITE_JPEG_QUALITY, 70])
@@ -573,9 +580,6 @@ def vision_worker(stop_event: threading.Event):
                 print(f"  [視覺] {dur_ms:.0f}ms: {desc[:90]}", flush=True)
         except Exception as e:
             print(f"  [視覺錯誤] {e}", flush=True)
-        finally:
-            try: _llm_inflight_lock.release()
-            except RuntimeError: pass
     print("  [視覺 worker] 結束")
 
 def _current_scene() -> str:
@@ -1646,12 +1650,11 @@ def _llm_chat_payload(payload: dict) -> dict:
 def _ask_via_ollama(text: str) -> dict:
     """Ollama native /api/chat，支援 S5 tool calling multi-turn loop。
     當 LLM_BACKEND=vllm 時自動 dispatch 到 vLLM endpoint（payload/response 雙向轉換）。"""
-    _llm_inflight_lock.acquire()
+    _llm_dialog_active.set()
     try:
         return _ask_via_ollama_inner(text)
     finally:
-        try: _llm_inflight_lock.release()
-        except RuntimeError: pass
+        _llm_dialog_active.clear()
 
 
 def _ask_via_ollama_inner(text: str) -> dict:
@@ -1957,12 +1960,11 @@ def _clean_speech(speech: str, actions: list) -> tuple[str, list]:
 def _ask_and_speak_streaming(text: str, mini) -> tuple[str, list]:
     """串流 LLM → sentence chunker → TTS queue → robot speaker。
     回傳 (完整 speech 字串, actions list)；失敗時 raise 讓上層 fallback。"""
-    _llm_inflight_lock.acquire()
+    _llm_dialog_active.set()
     try:
         return _ask_and_speak_streaming_inner(text, mini)
     finally:
-        try: _llm_inflight_lock.release()
-        except RuntimeError: pass
+        _llm_dialog_active.clear()
 
 
 def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
