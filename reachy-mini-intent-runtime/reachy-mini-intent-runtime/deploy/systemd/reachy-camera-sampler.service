@@ -1,0 +1,33 @@
+[Unit]
+Description=Reachy Mini camera sampler (low-rate frame grab + forward to off-board VLM)
+Documentation=file:///opt/reachy-mini-intent-runtime/docs/adr/0004-pi-cpu-qos-and-runtime-scheduling.md
+# Slice membership is established by `Slice=` in [Service]; do NOT use
+# PartOf=reachy-runtime.slice (wrong semantics).
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Service]
+Type=simple
+Slice=reachy-runtime.slice
+WorkingDirectory=/opt/reachy-mini-intent-runtime
+ExecStart=/opt/reachy-mini-intent-runtime/.venv/bin/python -m reachy_intent_runtime.camera_sampler
+Restart=on-failure
+RestartSec=2
+
+# --- Identity & hardening (P7) ---
+User=reachy
+Group=reachy
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/reachy
+
+# Tier 3 — background. Camera can drop frames under pressure without harm.
+CPUWeight=150
+CPUQuota=60%
+MemoryMax=128M
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

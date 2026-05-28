@@ -1,0 +1,43 @@
+[Unit]
+Description=Reachy Mini audio listener (VAD + wake/stop phrase detection)
+Documentation=file:///opt/reachy-mini-intent-runtime/docs/adr/0004-pi-cpu-qos-and-runtime-scheduling.md
+After=sound.target
+# Slice membership is established by `Slice=` in [Service]; do NOT use
+# PartOf=reachy-runtime.slice (wrong semantics).
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Service]
+Type=simple
+Slice=reachy-runtime.slice
+WorkingDirectory=/opt/reachy-mini-intent-runtime
+ExecStart=/opt/reachy-mini-intent-runtime/.venv/bin/python -m reachy_intent_runtime.audio_listener
+Restart=always
+RestartSec=1
+
+# --- Identity & hardening (P7) ---
+User=reachy
+Group=reachy
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/reachy
+# Audio listener uses Nice=-5 (below default), which requires CAP_SYS_NICE when
+# the process does not run as root. AmbientCapabilities grants it to the
+# unprivileged `reachy` user without escalating shell access.
+AmbientCapabilities=CAP_SYS_NICE
+
+# Tier 1 — top weight, top priority. Audio loss = robot deaf = user safety risk.
+CPUWeight=900
+CPUQuota=80%
+MemoryMax=64M
+Nice=-5
+
+# Realtime scheduling is OPT-IN. Uncomment after `bench_pi_runtime.sh --real-hardware`
+# confirms audio underruns persist under load.
+# CPUSchedulingPolicy=fifo
+# CPUSchedulingPriority=40
+
+[Install]
+WantedBy=multi-user.target

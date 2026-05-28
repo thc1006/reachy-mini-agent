@@ -25,8 +25,12 @@ ENV/
 Thumbs.db
 
 # ── Claude Code / AI tooling ──
-.claude/
-.cursor/
+# Anchored at repo root only — sub-projects (e.g. reachy-mini-intent-runtime/)
+# ship their own tracked .claude/agents/, hooks/, and settings.json that MUST
+# remain version-controlled. Without the leading `/`, the rule would silently
+# swallow them when sub-projects are added as tracked subdirectories.
+/.claude/
+/.cursor/
 
 # ── Secrets & local config ──
 .env
@@ -82,3 +86,42 @@ conversation_summary.txt.watermark
 # ── pytest + lint caches ──
 .pytest_cache/
 .ruff_cache/
+
+# ─────────────────────────────────────────────────────────────────────────
+# Local research artefacts — dev-box only, never pushed to public repo.
+# Per `feedback_research_repo_scope`: scratch scripts, result JSONs, bench
+# output dirs, PR/publication drafts all stay local. Root-anchored so
+# sub-projects (e.g. reachy-mini-intent-runtime/) keep their own files.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Underscore-prefixed scratch scripts and probes (Group B)
+/_*.py
+/_*.sh
+/_*.json
+
+# Scratch directories at root (Group D)
+/_publishing_drafts/
+/_wake_probe/
+
+# Bench / eval / recording output dirs at root (Group D)
+/bench_data_*/
+/chatterbox_eval_out/
+/chatterbox_eval_out_clone/
+/lang_test_baseline_*/
+/record/
+
+# Top-level scratch result JSONs (Group C — explicit so survives any future
+# loosening of the `/_*.json` rule above)
+/vlm_behavior_*_results.json
+/results_dense_*.json
+/results_moe_*.json
+
+# Binary reference material kept locally for study only (Group F)
+*.pptx
+*.pdf
+
+# Operational notes that contain stale internal IPs or local-only context
+# (NOTES-1 classification — keep 3 explicit; 4 others moved to docs/ subdirs)
+/goal.md
+/OSS_NOTES.md
+/progress_2026_05_12_13.md

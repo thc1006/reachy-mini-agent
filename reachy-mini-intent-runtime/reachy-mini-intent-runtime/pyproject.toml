@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reachy-mini-intent-runtime"
+version = "0.1.0"
+description = "Interruptible natural-language action scheduler for Reachy Mini dances and emotions"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Hsiu-Chi Tsai" }]
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.8",
+  "PyYAML>=6.0",
+]
+catalog = [
+  "PyYAML>=6.0",
+]
+reachy = [
+  "reachy-mini>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reachy_intent_runtime"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

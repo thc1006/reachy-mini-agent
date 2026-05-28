@@ -67,6 +67,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+# Sub-projects (e.g. reachy-mini-intent-runtime/) have their own pyproject.toml
+# and must not be scooped into the parent wheel when `pip install -e .` is run
+# from this directory.
+exclude = ["reachy-mini-intent-runtime/**"]
+
+[tool.pytest.ini_options]
+# Prevent pytest auto-discovery from recursing into self-contained sub-projects
+# that have their own venv + test suite.
+norecursedirs = ["reachy-mini-intent-runtime", ".venv", "venv", "build", "dist"]
 
 [tool.ruff]
 line-length = 99

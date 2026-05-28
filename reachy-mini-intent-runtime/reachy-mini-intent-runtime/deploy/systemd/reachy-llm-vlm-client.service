@@ -1,0 +1,37 @@
+[Unit]
+Description=Reachy Mini off-board LLM/VLM client placeholder (heartbeat-only mock; wire ExecStart before production)
+Documentation=file:///opt/reachy-mini-intent-runtime/docs/adr/0004-pi-cpu-qos-and-runtime-scheduling.md
+After=network-online.target
+# Slice membership is established by `Slice=` in [Service]; do NOT use
+# PartOf=reachy-runtime.slice (wrong semantics).
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Service]
+Type=simple
+Slice=reachy-runtime.slice
+WorkingDirectory=/opt/reachy-mini-intent-runtime
+# IMPORTANT: this is a placeholder. Production deployments MUST replace this
+# ExecStart with a thin HTTP/WebSocket client to an off-board LLM/VLM endpoint.
+# DO NOT load local model weights on CM4. See ADR-0004 §Decision.
+ExecStart=/opt/reachy-mini-intent-runtime/.venv/bin/python -m reachy_intent_runtime.llm_vlm_client
+Restart=on-failure
+RestartSec=5
+
+# --- Identity & hardening (P7) ---
+User=reachy
+Group=reachy
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/reachy
+
+# Tier 3 — lowest weight, tightest quota. Network latency dominates anyway.
+CPUWeight=100
+CPUQuota=40%
+MemoryMax=64M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

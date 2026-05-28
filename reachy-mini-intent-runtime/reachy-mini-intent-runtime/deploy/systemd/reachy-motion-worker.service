@@ -1,0 +1,36 @@
+[Unit]
+Description=Reachy Mini motion worker (SDK adapter + chunked dance/emotion executor)
+Documentation=file:///opt/reachy-mini-intent-runtime/docs/adr/0004-pi-cpu-qos-and-runtime-scheduling.md
+# Slice membership is established by `Slice=` in [Service]; do NOT use
+# PartOf=reachy-runtime.slice (wrong semantics).
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Service]
+Type=simple
+Slice=reachy-runtime.slice
+WorkingDirectory=/opt/reachy-mini-intent-runtime
+ExecStart=/opt/reachy-mini-intent-runtime/.venv/bin/python -m reachy_intent_runtime.motion_worker
+Restart=on-failure
+RestartSec=2
+
+# --- Identity & hardening (P7) ---
+User=reachy
+Group=reachy
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/reachy
+
+# Tier 2 — generous quota (often pegged during dances) but moderate weight.
+# Nice=0 keeps motion fair vs orchestrator under contention.
+CPUWeight=300
+CPUQuota=120%
+MemoryMax=384M
+Nice=0
+
+# SCHED_OTHER (default). No realtime — motion already chunks at chunk_ms boundary.
+
+[Install]
+WantedBy=multi-user.target

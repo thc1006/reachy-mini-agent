@@ -1,0 +1,14 @@
+[Unit]
+Description=Reachy Mini runtime slice (audio/vision/motion/orchestrator/LLM client)
+Documentation=file:///opt/reachy-mini-intent-runtime/docs/adr/0004-pi-cpu-qos-and-runtime-scheduling.md
+# NOTE: do NOT add `Before=slices.target` — slices are activated on demand by
+# `Slice=` membership; explicit ordering against slices.target is incorrect.
+
+[Slice]
+# Enable resource accounting so we can observe and enforce per-service budgets.
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+# Overall slice budget on Pi CM4 (4 cores). Leave 1 core for kernel + daemon.
+CPUQuota=380%
+MemoryMax=2G

@@ -1,0 +1,282 @@
+# Reachy Mini Official Action Catalog
+#
+# Source       : docs/research/2026-05-28-official-stack.md
+#                + Pollen Robotics HF datasets (pollen-robotics/reachy-mini-
+#                  dances-library, pollen-robotics/reachy-mini-emotions-library)
+#                + Reachy Mini Conversation App LLM tools
+#                  (dance, stop_dance, play_emotion, stop_emotion, move_head,
+#                   camera, head_tracking, idle_do_nothing).
+# Last-updated : 2026-05-28
+# Verification : DRAFT - not hardware-verified.  All durations are upper-bound
+#                estimates derived from public tool descriptions and library
+#                sample lengths; replace with measured values once real Reachy
+#                Mini benchmarking is available.  Mark verified entries with a
+#                future ``verified_at_<date>`` field per
+#                docs/research/reachy-official-action-catalog.md.
+#
+# Schema (per entry):
+#   name                  : unique identifier used by the orchestrator
+#   type                  : dance | emotion | pose | speech | camera | stop
+#   official_tool         : LLM tool name from the conversation app
+#   estimated_duration_ms : upper-bound expected runtime, integer ms
+#   interruptible         : true | false | unknown  (use unknown liberally)
+#   has_stop_tool         : bool; does a discrete stop primitive exist?
+#   stop_tool             : optional, name of the stop primitive
+#   requires_segmentation : bool; ADR-0001 - true for non-interruptible long
+#                           actions that need chunking to allow preemption
+#   cpu_risk              : low | medium | high
+#   source                : provenance string (dataset / doc URL fragment)
+#   notes                 : free text
+
+# ---------------------------------------------------------------------------
+# DANCE entries  (pollen-robotics/reachy-mini-dances-library)
+# ---------------------------------------------------------------------------
+
+- name: dance_happy
+  type: dance
+  official_tool: dance
+  estimated_duration_ms: 8000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_dance
+  requires_segmentation: true
+  cpu_risk: medium
+  source: pollen-robotics/reachy-mini-dances-library
+  notes: "Joyful body sway, ~8s; mapped via dance tool with optional dance_name param."
+
+- name: dance_sad
+  type: dance
+  official_tool: dance
+  estimated_duration_ms: 10000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_dance
+  requires_segmentation: true
+  cpu_risk: medium
+  source: pollen-robotics/reachy-mini-dances-library
+  notes: "Slow drooping sway; longer than happy. Interruptibility uncertain - segmented."
+
+- name: dance_energetic
+  type: dance
+  official_tool: dance
+  estimated_duration_ms: 12000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_dance
+  requires_segmentation: true
+  cpu_risk: high
+  source: pollen-robotics/reachy-mini-dances-library
+  notes: "Fast head/antenna motion; high CPU risk on CM4 due to trajectory rate."
+
+- name: dance_slow
+  type: dance
+  official_tool: dance
+  estimated_duration_ms: 15000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_dance
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-dances-library
+  notes: "Long gentle motion; chunk into 250ms segments for preemption."
+
+- name: dance_bow
+  type: dance
+  official_tool: dance
+  estimated_duration_ms: 4000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_dance
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-dances-library
+  notes: "Greeting bow; short but non-interruptible until segmentation verified."
+
+- name: dance_wave
+  type: dance
+  official_tool: dance
+  estimated_duration_ms: 5000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_dance
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-dances-library
+  notes: "Antenna/head wave gesture; commonly used for greetings."
+
+# ---------------------------------------------------------------------------
+# EMOTION entries  (pollen-robotics/reachy-mini-emotions-library)
+# ---------------------------------------------------------------------------
+
+- name: emotion_happy
+  type: emotion
+  official_tool: play_emotion
+  estimated_duration_ms: 3000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_emotion
+  requires_segmentation: true
+  cpu_risk: medium
+  source: pollen-robotics/reachy-mini-emotions-library
+  notes: "Trajectory + paired WAV; segment to allow stop_emotion preemption."
+
+- name: emotion_sad
+  type: emotion
+  official_tool: play_emotion
+  estimated_duration_ms: 4000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_emotion
+  requires_segmentation: true
+  cpu_risk: medium
+  source: pollen-robotics/reachy-mini-emotions-library
+  notes: "Slower expressive sequence with audio cue."
+
+- name: emotion_surprised
+  type: emotion
+  official_tool: play_emotion
+  estimated_duration_ms: 2000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_emotion
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-emotions-library
+  notes: "Quick startle animation; short but still segmented for consistency."
+
+- name: emotion_calm
+  type: emotion
+  official_tool: play_emotion
+  estimated_duration_ms: 5000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_emotion
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-emotions-library
+  notes: "Gentle breathing-like loop; ideal background filler."
+
+- name: emotion_curious
+  type: emotion
+  official_tool: play_emotion
+  estimated_duration_ms: 3500
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_emotion
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-emotions-library
+  notes: "Head tilt + antenna twitch; commonly chained with head_tracking."
+
+- name: emotion_sleepy
+  type: emotion
+  official_tool: play_emotion
+  estimated_duration_ms: 6000
+  interruptible: unknown
+  has_stop_tool: true
+  stop_tool: stop_emotion
+  requires_segmentation: true
+  cpu_risk: low
+  source: pollen-robotics/reachy-mini-emotions-library
+  notes: "Slow nodding loop; safe candidate for idle-time playback."
+
+# ---------------------------------------------------------------------------
+# POSE entries  (move_head, idle_do_nothing)
+# ---------------------------------------------------------------------------
+
+- name: pose_idle
+  type: pose
+  official_tool: idle_do_nothing
+  estimated_duration_ms: 0
+  interruptible: true
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: low
+  source: reachy_mini_conversation_app LLM tools (idle_do_nothing)
+  notes: "Explicit no-op pose; trivially interruptible."
+
+- name: pose_neutral
+  type: pose
+  official_tool: move_head
+  estimated_duration_ms: 500
+  interruptible: true
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: low
+  source: reachy_mini_conversation_app LLM tools (move_head)
+  notes: "Return head to neutral via goto_target; quick interpolation."
+
+- name: pose_look_user
+  type: pose
+  official_tool: move_head
+  estimated_duration_ms: 800
+  interruptible: true
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: low
+  source: reachy_mini_conversation_app LLM tools (move_head)
+  notes: "Re-orient head toward detected user via move_head."
+
+# ---------------------------------------------------------------------------
+# CAMERA / HEAD TRACKING entries
+# ---------------------------------------------------------------------------
+
+- name: camera_capture
+  type: camera
+  official_tool: camera
+  estimated_duration_ms: 300
+  interruptible: true
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: medium
+  source: reachy_mini_conversation_app LLM tools (camera)
+  notes: "Single frame capture; CPU risk medium due to image encode on CM4."
+
+- name: head_tracking_on
+  type: camera
+  official_tool: head_tracking
+  estimated_duration_ms: 0
+  interruptible: true
+  has_stop_tool: true
+  stop_tool: head_tracking
+  requires_segmentation: false
+  cpu_risk: medium
+  source: reachy_mini_conversation_app LLM tools (head_tracking)
+  notes: "Toggle on; runs as background loop until head_tracking off is called."
+
+- name: head_tracking_off
+  type: camera
+  official_tool: head_tracking
+  estimated_duration_ms: 0
+  interruptible: true
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: low
+  source: reachy_mini_conversation_app LLM tools (head_tracking)
+  notes: "Toggle off; instant."
+
+# ---------------------------------------------------------------------------
+# STOP entries  (critical-priority discrete stop primitives)
+# ---------------------------------------------------------------------------
+
+- name: stop_dance
+  type: stop
+  official_tool: stop_dance
+  estimated_duration_ms: 0
+  interruptible: false
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: low
+  source: reachy_mini_conversation_app LLM tools (stop_dance)
+  notes: "Critical-priority discrete stop; itself non-interruptible and has no further stop tool."
+
+- name: stop_emotion
+  type: stop
+  official_tool: stop_emotion
+  estimated_duration_ms: 0
+  interruptible: false
+  has_stop_tool: false
+  requires_segmentation: false
+  cpu_risk: low
+  source: reachy_mini_conversation_app LLM tools (stop_emotion)
+  notes: "Critical-priority discrete stop for emotion playback; non-interruptible."

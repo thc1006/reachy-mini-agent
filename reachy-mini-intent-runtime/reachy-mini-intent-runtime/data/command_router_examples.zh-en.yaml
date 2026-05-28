@@ -1,0 +1,182 @@
+# Reachy Mini intent router canonical dataset
+# Verified by tests/test_command_vs_chat_router.py against RuleIntentClassifier
+# Edit this file to add new utterances; tests will auto-pick them up.
+#
+# NOTE: Adding a new utterance here automatically becomes a test case in
+# tests/test_command_vs_chat_router.py. Run `pytest -q
+# tests/test_command_vs_chat_router.py` to confirm the classifier still
+# satisfies every example. If a real-world utterance fails, ADD it to this
+# YAML FIRST, then file a follow-up to strengthen the classifier patterns
+# (see docs/sdd/command-router-acceptance.md §Maintenance).
+
+version: 1
+last_updated: 2026-05-28
+
+groups:
+  # ---------------------------------------------------------------------
+  # BACKGROUND dance commands
+  # ---------------------------------------------------------------------
+  - name: dance_commands_zh
+    expect:
+      kind: command
+      action: dance
+      priority: background
+    examples:
+      - "跳支舞"
+      - "Reachy，跳支舞"
+      - "跳一段舞"
+      - "幫我跳個舞"
+      - "可以跳舞給我看嗎"
+      - "表演一段舞"
+
+  - name: dance_commands_en
+    expect:
+      kind: command
+      action: dance
+      priority: background
+    examples:
+      - "dance for me"
+      - "dance now"
+      - "please dance"
+
+  # ---------------------------------------------------------------------
+  # CRITICAL stop commands
+  # ---------------------------------------------------------------------
+  - name: stop_critical_zh
+    expect:
+      kind: command
+      action: stop_dance
+      priority: critical
+    examples:
+      - "停止跳舞"
+      - "不要跳了"
+      - "停下"
+
+  - name: stop_critical_en
+    expect:
+      kind: command
+      action: stop_dance
+      priority: critical
+    examples:
+      - "stop dancing"
+      - "Stop Dancing"
+      - "STOP"
+      - "Reachy stop"        # NEW edge — bilingual prefix + bare English stop
+      - "cancel"             # NEW edge — alternate stop imperative covered by patterns
+      - "abort"              # NEW edge — abort imperative covered by patterns
+
+  # ---------------------------------------------------------------------
+  # CRITICAL hush / quiet commands
+  # ---------------------------------------------------------------------
+  - name: hush_critical
+    expect:
+      kind: command
+      action: stop_emotion
+      priority: critical
+    examples:
+      - "噓"
+      - "噓！"
+      - "噓，小聲一點"
+      - "安靜"
+      - "be quiet please"
+      - "Reachy 噓"           # NEW edge — bilingual name + Chinese hush
+      - "hush now"            # NEW edge — English imperative variant
+      - "please be quiet"     # NEW edge — polite English variant
+
+  # ---------------------------------------------------------------------
+  # CHAT — preferences and questions about dance
+  # ---------------------------------------------------------------------
+  - name: chat_dance_preferences
+    expect:
+      kind: chat
+    examples:
+      - "我喜歡跳舞"
+      - "我其實很喜歡跳舞"
+      - "跳舞很好玩"
+      - "我想學跳舞"
+      - "i like dancing"
+      - "dance is fun"
+      - "你會跳舞嗎？"
+      - "你剛剛跳舞很好笑"
+
+  - name: chat_dance_refusal
+    expect:
+      kind: chat
+    examples:
+      - "我不想跳舞"
+      - "我才不要跳舞"
+      - "我不喜歡跳舞"
+
+  # ---------------------------------------------------------------------
+  # AMBIGUOUS — needs LLM context
+  # ---------------------------------------------------------------------
+  - name: ambiguous_negated_stop
+    expect:
+      kind: ambiguous
+    examples:
+      - "不要停止跳舞"
+      - "請別停下"
+      - "請繼續跳舞，不要停"
+      - "別停"
+      - "don't stop dancing"
+      - "do not stop the dance"
+
+  - name: ambiguous_emotion_semantic
+    expect:
+      kind: ambiguous
+    examples:
+      - "難過一點"
+      - "笑一下"
+      - "做個鬼臉"
+
+  - name: ambiguous_capability_plus_imperative
+    expect:
+      kind: ambiguous
+    examples:
+      - "你會跳舞嗎，跳給我看"
+
+  # ---------------------------------------------------------------------
+  # EDGE — descriptive uses that must NOT fire a command
+  # ---------------------------------------------------------------------
+  - name: edge_descriptive_quiet
+    expect:
+      kind: chat
+    examples:
+      - "我安靜地坐著"
+      - "圖書館很安靜"
+      - "他很安靜地離開"
+
+  - name: edge_descriptive_hush
+    expect:
+      kind: chat
+    examples:
+      - "我聽到噓聲"
+      - "觀眾在噓他"
+      - "他被噓下台"
+
+  # ---------------------------------------------------------------------
+  # EDGE — empty / filler / bare punctuation must stay chat
+  # ---------------------------------------------------------------------
+  - name: edge_empty_and_filler
+    expect:
+      kind: chat
+    examples:
+      - ""
+      - "   "
+      - "?"
+      - "嗯"
+
+  # ---------------------------------------------------------------------
+  # EDGE — long-sentence dance request (NEW: pushes beyond test_classifier.py)
+  # The classifier currently fires `dance` for any sentence containing the
+  # 跳…舞 pattern. Captured here so future tightening of the pattern surfaces
+  # as an explicit test failure rather than a silent regression.
+  # ---------------------------------------------------------------------
+  - name: edge_long_sentence_dance
+    status: known_debt
+    expect:
+      kind: command
+      action: dance
+      priority: background
+    examples:
+      - "我覺得你今天表現得很棒，跳個舞慶祝一下"

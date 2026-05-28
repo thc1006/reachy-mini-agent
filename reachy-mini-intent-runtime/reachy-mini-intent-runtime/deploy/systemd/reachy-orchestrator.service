@@ -1,0 +1,39 @@
+[Unit]
+Description=Reachy Mini orchestrator worker (intent routing + scheduler)
+Documentation=file:///opt/reachy-mini-intent-runtime/docs/adr/0004-pi-cpu-qos-and-runtime-scheduling.md
+After=network.target
+# Slice membership is established by `Slice=` in [Service]; do NOT use
+# PartOf=reachy-runtime.slice (wrong semantics — PartOf is for service<->service
+# stop-propagation only).
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Service]
+Type=simple
+Slice=reachy-runtime.slice
+WorkingDirectory=/opt/reachy-mini-intent-runtime
+ExecStart=/opt/reachy-mini-intent-runtime/.venv/bin/python -m reachy_intent_runtime.orchestrator_worker
+Restart=on-failure
+RestartSec=2
+
+# --- Identity & hardening (P7) ---
+User=reachy
+Group=reachy
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/reachy
+
+# Tier 2 — high weight, generous quota, slightly elevated priority.
+CPUWeight=600
+CPUQuota=80%
+MemoryMax=128M
+Nice=-3
+
+# Realtime scheduling is OPT-IN per ADR-0004. Uncomment after benchmarking.
+# CPUSchedulingPolicy=fifo
+# CPUSchedulingPriority=30
+
+[Install]
+WantedBy=multi-user.target

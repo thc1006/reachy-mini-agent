@@ -1,0 +1,12 @@
+# Built-in official conversation-app tools, if available:
+dance
+stop_dance
+play_emotion
+stop_emotion
+move_head
+camera
+head_tracking
+idle_do_nothing
+
+# External tool from this repository:
+interruptible_action
