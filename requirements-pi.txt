@@ -1,0 +1,3 @@
+# Pi-specific pins: mediapipe<5 forces protobuf 4.25.9; mem0ai>=2.0.5 may raise the floor
+mem0ai==2.0.4
+protobuf==4.25.9

@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import urllib.error
@@ -66,6 +67,31 @@ DEFAULT_EMBED_DIMS     = int(os.getenv("MEM0_EMBED_DIMS", "1024"))
 # Namespace tag attached to every add() -- partitions facts by domain
 # (elder_facts: medications, contacts, allergies, preferences).
 DEFAULT_NAMESPACE      = os.getenv("MEM0_NAMESPACE", "elder_facts")
+
+# M-M3: known FastEmbed model dimensions. If MEM0_EMBED_DIMS contradicts the
+# model's actual output shape, Qdrant will reject inserts with a dimension
+# mismatch error long after init succeeded. We override + warn loudly at init.
+KNOWN_MODEL_DIMS = {
+    "BAAI/bge-small-zh-v1.5": 512,
+    "BAAI/bge-m3":            1024,
+    "BAAI/bge-base-zh-v1.5":  768,
+    "BAAI/bge-small-en-v1.5": 384,
+}
+
+# H-M3: disk-full guard thresholds. Embedded Qdrant mmap + segment compaction
+# silently corrupts the collection if it runs out of space mid-flush.
+_QDRANT_INIT_MIN_FREE_BYTES = 100 * 1024 * 1024   # 100 MB at init
+_QDRANT_ADD_MIN_FREE_BYTES  =  50 * 1024 * 1024   #  50 MB before each add
+
+
+class _RedactedApiKey(str):
+    """str subclass that hides the literal value when repr'd (logs, tracebacks).
+    Subclassing str means all .lstrip() / .encode() / f-string calls still
+    work transparently; only __repr__ is shadowed."""
+    def __repr__(self) -> str:
+        if not self:
+            return "''"
+        return f"'<redacted len={len(self)}>'"
 
 
 class RobotMemory:
@@ -117,8 +143,23 @@ class RobotMemory:
         self.llm_provider = (llm_provider or "ollama").lower()
         self.embed_provider = (embed_provider or "ollama").lower()
         self.llm_base_url = llm_base_url
-        self.llm_api_key = llm_api_key
+        # H-M4: wrap api key in a str subclass that redacts itself when repr'd
+        # (logs, tracebacks, pdb sessions, future structured logger output).
+        # Never include the live value in the init banner below.
+        self.llm_api_key = _RedactedApiKey(llm_api_key or "")
         self.namespace = namespace
+        self.qdrant_path = qdrant_path
+
+        # H-M2: warn loudly when Qdrant lives on the Pi SD card / user home.
+        # mmap + segment compaction does serious write amplification; a long-
+        # term elder-care deployment will burn an A2 SD card. Operators should
+        # bind-mount /home/pollen/brain/.qdrant_memory to tmpfs or a USB SSD.
+        _qp = str(qdrant_path)
+        if _qp.startswith("/home/pollen/") or _qp.startswith("~/") or _qp.startswith(str(Path.home())):
+            print(
+                f"  [robot_memory] WARNING: qdrant on SD-card-likely path {qdrant_path!r} -- "
+                "consider tmpfs or external SSD (mmap+compaction write amplification)"
+            )
 
         if os.getenv("ROBOT_MEMORY", "1") != "1":
             return   # explicitly disabled
@@ -130,6 +171,39 @@ class RobotMemory:
             return
 
         Path(qdrant_path).mkdir(parents=True, exist_ok=True)
+
+        # H-M3: disk-full guard at init. If we have less than 100 MB free
+        # on the qdrant volume, refuse to enable so we don't corrupt the
+        # collection on first flush. Best-effort obs counter bump.
+        try:
+            _free = shutil.disk_usage(qdrant_path).free
+            if _free < _QDRANT_INIT_MIN_FREE_BYTES:
+                print(
+                    f"  [robot_memory] disabled: only {_free / 1024**2:.0f} MB free on "
+                    f"qdrant volume {qdrant_path!r} (need >= "
+                    f"{_QDRANT_INIT_MIN_FREE_BYTES // 1024**2} MB)"
+                )
+                try:
+                    import brain_observability as _obs  # type: ignore
+                    _obs.llm_fallback_total.labels(reason="mem0_disk_full_init").inc()
+                except Exception:
+                    pass
+                return
+        except Exception as _e:
+            print(f"  [robot_memory] disk_usage check failed (non-fatal): {_e}")
+
+        # M-M3: known-model dimension reconciliation. Mismatched embed_dims
+        # vs. the model's actual output shape only surfaces at first insert
+        # (Qdrant validation error), too late. Warn + override at init.
+        if self.embed_provider == "fastembed" and embed_model in KNOWN_MODEL_DIMS:
+            _expected = KNOWN_MODEL_DIMS[embed_model]
+            if int(embed_dims) != _expected:
+                print(
+                    f"  [robot_memory] WARNING: MEM0_EMBED_DIMS={embed_dims} does not match "
+                    f"FastEmbed model {embed_model!r} (expected {_expected}); overriding to "
+                    f"{_expected} to prevent silent Qdrant dimension mismatch on first insert"
+                )
+                embed_dims = _expected
 
         if self.llm_provider == "openai":
             llm_cfg = {
@@ -165,6 +239,10 @@ class RobotMemory:
                 },
             }
 
+        # M-M6: Embedded Qdrant is SINGLE-WRITER. A second process attempting
+        # to open the same on-disk path raises StorageError on the LMDB lock.
+        # Production must run exactly one robot_brain at a time per Qdrant
+        # path; bench scripts that re-import this module must use a tmp path.
         config = {
             "llm": llm_cfg,
             "embedder": embed_cfg,
@@ -187,10 +265,14 @@ class RobotMemory:
                 max_workers=1, thread_name_prefix="mem0-summary"
             )
             self.enabled = True
+            # H-M4: never log api_key or base_url here. base_url is logged at
+                # vLLM serve-time anyway and api_key is a "dummy" today but won't
+                # be tomorrow (OpenAI / Anthropic when we route paid models for
+                # nuanced summary). Keep the banner reproducible without secrets.
             print(
                 f"  [robot_memory] enabled -- qdrant={qdrant_path} user={user_id} "
                 f"llm={self.llm_provider}:{llm_model} embed={self.embed_provider}:{embed_model} "
-                f"ns={self.namespace}"
+                f"dims={int(embed_dims)} ns={self.namespace}"
             )
         except Exception as e:
             # Ollama down, bad config, bge-m3 not pulled, etc.
@@ -238,7 +320,31 @@ class RobotMemory:
         # Rolling summary trigger (async, never blocks caller)
         self._schedule_summary_maybe()
 
-    def _add_safe(self, text: str) -> None:
+    def _add_safe(self, text: str, metadata: dict | None = None) -> None:
+        # H-M3: per-add disk-full short circuit. If the qdrant volume is
+        # nearly full, skip the insert (caller is fire-and-forget; main loop
+        # continues). Embedded Qdrant corrupts the collection on mid-flush
+        # ENOSPC; better to drop the turn than scramble the store.
+        try:
+            _free = shutil.disk_usage(self.qdrant_path).free
+            if _free < _QDRANT_ADD_MIN_FREE_BYTES:
+                print(
+                    f"  [robot_memory] drop add: only {_free / 1024**2:.0f} MB free "
+                    f"(need >= {_QDRANT_ADD_MIN_FREE_BYTES // 1024**2} MB)"
+                )
+                try:
+                    import brain_observability as _obs  # type: ignore
+                    _obs.llm_fallback_total.labels(reason="mem0_disk_full_add").inc()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass  # disk_usage failing is non-fatal — proceed with add
+        # H-M5: merge caller-supplied metadata. Namespace is always set by
+        # the class (caller can't override it — partitioning invariant);
+        # other keys flow through (e.g. {"source": "voice_turn"}).
+        merged_meta = dict(metadata or {})
+        merged_meta["namespace"] = self.namespace
         try:
             with self._lock:
                 # Tag every fact with namespace metadata so callers can later
@@ -247,7 +353,7 @@ class RobotMemory:
                 self._memory.add(
                     text,
                     user_id=self.user_id,
-                    metadata={"namespace": self.namespace},
+                    metadata=merged_meta,
                 )
         except urllib.error.HTTPError as e:
             body = ""
@@ -426,7 +532,11 @@ class RobotMemory:
                         "Authorization": f"Bearer {self.llm_api_key}",
                     },
                 )
-                with urllib.request.urlopen(req, timeout=180) as resp:
+                # M-M1: 180 s was the legacy Ollama bge-m3 ceiling; vLLM
+                # never legitimately exceeds 30 s for a 500-token summary.
+                # Tighter cap surfaces a stuck backend instead of stalling
+                # the next summary cycle behind a zombie request.
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 summary = (
                     (data.get("choices") or [{}])[0]
@@ -434,6 +544,11 @@ class RobotMemory:
                     .get("content")
                     or ""
                 ).strip()
+                # M-M5: surface vLLM error envelopes (rate limit, content
+                # filter, unexpected shape) — otherwise an empty summary
+                # silently returns and the next cycle re-attempts forever.
+                if not summary:
+                    print(f"  [robot_memory] empty summary, raw={str(data)[:200]}")
             else:
                 payload = {
                     "model": self.llm_model,
@@ -467,20 +582,34 @@ class RobotMemory:
             print(f"  [robot_memory] summary LLM call failed: {e}")
 
     # ------------------------------------------------------------- search ---
-    def search(self, query: str, limit: int = 3, timeout: float = 4.0) -> List[str]:
+    def search(self, query: str, limit: int = 3, timeout: float = 4.0,
+               namespace: str | None = None) -> List[str]:
         """Return list of memory fact strings relevant to `query`. Empty list
         on any failure or if disabled.
 
         Synchronous but bounded — intended to be called in the main dialog
         flow before an LLM call.
+
+        H-M1: by default the search is partitioned by the class's namespace
+        (every add() tags with `metadata.namespace`, otherwise the store is
+        write-only — we'd add tagged facts but search all tags). Pass
+        namespace="" to override the partition and scan every entry; pass
+        an explicit string to query a different namespace (multi-domain
+        deployments, e.g. namespace="game_facts").
         """
         if not self.enabled or not query:
             return []
+        # Decide which namespace to scope to. Empty string = explicit
+        # "scan everything"; None = default to the class namespace.
+        ns = namespace if namespace is not None else self.namespace
+        filters: dict[str, Any] = {"user_id": self.user_id}
+        if ns:
+            filters["metadata.namespace"] = ns
         try:
             # Mem0 2.x uses filters= instead of top-level user_id in search()
             result = self._memory.search(
                 query=query,
-                filters={"user_id": self.user_id},
+                filters=filters,
                 limit=limit,
             )
         except Exception as e:
@@ -521,3 +650,10 @@ class RobotMemory:
         if self._executor is not None:
             self._executor.shutdown(wait=True, cancel_futures=False)
             self._executor = None
+        # M-M7: summary executor was previously leaked on shutdown — a
+        # pending _regenerate_summary call could block process exit
+        # indefinitely waiting for vLLM. shutdown(wait=True) ensures the
+        # pending future drains (or finishes its tenacity-less retries).
+        if self._summary_executor is not None:
+            self._summary_executor.shutdown(wait=True, cancel_futures=False)
+            self._summary_executor = None

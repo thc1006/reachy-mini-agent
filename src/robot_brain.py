@@ -3032,6 +3032,18 @@ def main():
         logger.info("brain_ready",
                     threads=["tracking_loop", "hand_worker", "vision_worker"],
                     mic=mic_src)
+        # M-M4: eager-warm Mem0 in a background thread so the first user
+        # turn doesn't pay the cold-load tax (FastEmbed model dl + Qdrant
+        # collection open ~ 5-8 s on Pi). _get_robot_memory() is itself
+        # lazy + idempotent so this is a fire-and-forget warmup.
+        try:
+            threading.Thread(
+                target=_get_robot_memory,
+                daemon=True,
+                name="mem0-eager-warm",
+            ).start()
+        except Exception as _e:
+            print(f"  [mem0 eager-warm start err] {_e}")
 
         # Start the gated watchdog thread: every 10 s it checks the oldest
         # per-thread heartbeat; if any registered worker has been silent for
