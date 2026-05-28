@@ -476,6 +476,15 @@ def _make_hand_landmarker():
 # auto-restart-cycling every ~16 min via watchdog (A1 diagnostic, Wave3-P2).
 # Mitigation: periodic .close()+recreate inside hand_worker (every
 # HAND_LANDMARKER_RECREATE_S seconds, default 300s).
+#
+# Wave6-P1 #93: HAND_LANDMARKER_ENABLED master switch. Default 1 keeps the
+# Wave3-P2 behaviour (spawn hand_worker + run HandLandmarker with periodic
+# recreate). Set to 0 to fully disable hand_worker for Phase 1 leak
+# mitigation per sub-agent #100 GO recommendation; finger-counting feature
+# is lost but vision_worker / elder_fallguard are unaffected (they read
+# _latest_frame written by tracking_loop). Phase 2 (#94) will remove the
+# code path entirely after soak observation.
+_HAND_LANDMARKER_ENABLED = os.getenv("HAND_LANDMARKER_ENABLED", "1") != "0"
 hand_landmarker = _make_hand_landmarker()
 _hand_lock = threading.Lock()  # mediapipe 不保證 thread-safe
 _hand_call_count = 0           # for periodic gc.collect() (every 50 detect() calls)
@@ -3032,14 +3041,21 @@ def main():
 
         stop_event = threading.Event()
         tracker    = threading.Thread(target=tracking_loop, args=(mini, stop_event), daemon=True)
-        hands      = threading.Thread(target=hand_worker, args=(mini, stop_event), daemon=True)
         vision     = threading.Thread(target=vision_worker, args=(stop_event,), daemon=True)
         motor_st   = threading.Thread(target=motor_state_poll_loop, args=(stop_event,), daemon=True)
         # Start motor-state poll FIRST so face_tracker has a non-"unknown"
         # reading by the time its first frame fires (1 s poll interval).
         motor_st.start()
         tracker.start()
-        hands.start()
+        # Wave6-P1 #93: hand_worker spawn now gated by HAND_LANDMARKER_ENABLED
+        # (default 1 = backwards compatible). When 0, MediaPipe HandLandmarker
+        # is never invoked from a worker thread; vision_worker still reads
+        # _latest_frame normally so the rest of the brain is unaffected.
+        if _HAND_LANDMARKER_ENABLED:
+            hands  = threading.Thread(target=hand_worker, args=(mini, stop_event), daemon=True)
+            hands.start()
+        else:
+            logger.info("hand_landmarker_disabled", reason="HAND_LANDMARKER_ENABLED=0")
         vision.start()
 
         # Wave4-P4 (#74) ElderFallGuard: MediaPipe Pose fall detector. NO new
@@ -3079,8 +3095,11 @@ def main():
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")
         _sd_notify("READY=1")
+        _ready_threads = ["tracking_loop", "vision_worker"]
+        if _HAND_LANDMARKER_ENABLED:
+            _ready_threads.insert(1, "hand_worker")
         logger.info("brain_ready",
-                    threads=["tracking_loop", "hand_worker", "vision_worker"],
+                    threads=_ready_threads,
                     mic=mic_src)
         # M-M4: eager-warm Mem0 in a background thread so the first user
         # turn doesn't pay the cold-load tax (FastEmbed model dl + Qdrant
@@ -3115,8 +3134,13 @@ def main():
         # conversation), incorrectly tripping the systemd watchdog. It
         # registers itself on first pulse when a real conversation begins;
         # if a turn hangs >60 s the watchdog correctly gates — that's intent.
-        for _name in ("tracking_loop", "hand_worker", "vision_worker",
-                      "main_idle"):
+        # Wave6-P1 #93: only seed hand_worker pulse when HAND_LANDMARKER_ENABLED
+        # — otherwise the watchdog would mark it as stale immediately since the
+        # thread was never spawned, tripping a spurious systemd restart.
+        _seed_threads = ["tracking_loop", "vision_worker", "main_idle"]
+        if _HAND_LANDMARKER_ENABLED:
+            _seed_threads.insert(1, "hand_worker")
+        for _name in _seed_threads:
             obs.pulse(_name)
         # ARM the watchdog AFTER seeding pulses. From this moment, if 30 s
         # pass with still no heartbeats, the watchdog treats the brain as
