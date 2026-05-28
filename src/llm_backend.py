@@ -33,13 +33,15 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.6:35b-a3b")
 def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: str) -> str:
     """Resolve a vLLM base URL from env vars.
 
-    Accepts either a bare host (preferred new convention; combined with port_env
-    into ``http://{host}:{port}``) or a full ``http(s)://`` URL (legacy form,
-    returned as-is). Empty host falls back to ``default_host``.
+    Accepts: full ``http(s)://`` URL (legacy, returned as-is with trailing slash
+    stripped), bare ``host:port`` (returned as ``http://host:port``), or bare
+    ``host`` (combined with ``port_env``/``default_port``).
     """
     host = (os.getenv(host_env) or default_host).strip()
     if host.startswith("http://") or host.startswith("https://"):
-        return host
+        return host.rstrip("/")
+    if ":" in host and not host.startswith("["):
+        return f"http://{host}"
     port = (os.getenv(port_env) or default_port).strip()
     return f"http://{host}:{port}"
 

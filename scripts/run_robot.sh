@@ -11,8 +11,13 @@ export LLM_MODE=ollama
 # AWQ-Marlin quant that the hardware was benchmarked for. Set LLM_BACKEND=ollama
 # to fall back (ollama qwen3.6:35b-a3b must be loaded — won't fit alongside vLLM).
 export LLM_BACKEND=vllm
-export VLLM_HOST=http://localhost:8000
-export VLLM_MODEL=qwen36-awq
+# vllm0528 = TWCC NGC container (2× V100), Tailscale MagicDNS. Was s1 (2× 3090,
+# dead since 2026-05-28 NVML mismatch). VLLM_HOST/VLLM_PORT are env-overridable
+# so operators can repoint without editing this file (e.g. VLLM_HOST=s1 once
+# revived). Bare host preferred; _vllm_base() in robot_brain.py adds scheme+port.
+export VLLM_HOST=${VLLM_HOST:-vllm0528}
+export VLLM_PORT=${VLLM_PORT:-8000}
+export VLLM_MODEL=${VLLM_MODEL:-qwen36-awq}
 export OLLAMA_HOST=http://localhost:11434
 export OLLAMA_MODEL=qwen3.6:35b-a3b
 export OLLAMA_THINK=0

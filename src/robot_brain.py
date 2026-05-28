@@ -1382,23 +1382,24 @@ OLLAMA_THINK     = os.getenv("OLLAMA_THINK", "0") == "1"
 LLM_BACKEND      = os.getenv("LLM_BACKEND", "ollama").lower()
 
 def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: str) -> str:
-    """Resolve a vLLM base URL from env vars (bare host + port, or full URL).
+    """Resolve a vLLM base URL from env vars.
 
-    If ``$host_env`` starts with ``http://`` / ``https://`` it is returned as-is
-    (legacy form for backward compat). Otherwise we combine the bare host with
-    ``$port_env`` into ``http://{host}:{port}`` — preferred new convention so a
-    single VLLM_PORT toggle covers primary + backup.
+    Accepts: full ``http(s)://`` URL (legacy, returned as-is with trailing slash
+    stripped), bare ``host:port`` (returned as ``http://host:port``), or bare
+    ``host`` (combined with ``port_env``/``default_port``).
     """
     host = (os.getenv(host_env) or default_host).strip()
     if host.startswith("http://") or host.startswith("https://"):
-        return host
+        return host.rstrip("/")
+    if ":" in host and not host.startswith("["):
+        return f"http://{host}"
     port = (os.getenv(port_env) or default_port).strip()
     return f"http://{host}:{port}"
 
 
-# TODO(blue/green): single-boot auto-failover not wired — VLLM_HOST_BACKUP is
-# currently exposed for manual failover only (no inline retry/circuit-breaker).
-VLLM_HOST_RAW    = os.getenv("VLLM_HOST", "http://localhost:8000")  # legacy display only
+# Manual failover only — VLLM_HOST_BACKUP is parsed but not yet wired to inline
+# retry/circuit-breaker. Operators swap by exporting VLLM_HOST=<backup> + systemctl
+# restart. TODO: cooperative retry on httpx.ConnectError → swap to backup once.
 VLLM_PORT        = os.getenv("VLLM_PORT", "8000")
 VLLM_HOST        = _vllm_base("VLLM_HOST", "VLLM_PORT", "vllm0528", "8000")
 VLLM_HOST_BACKUP = _vllm_base("VLLM_HOST_BACKUP", "VLLM_PORT_BACKUP", "s1", "8000")

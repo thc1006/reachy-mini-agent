@@ -20,8 +20,10 @@ export REACHY_HOST=${REACHY_HOST:-100.85.191.3}
 # When LLM_BACKEND=vllm, every chat / vision / streaming call routes to the
 # vLLM endpoint instead of Ollama (continuous batching = no contention).
 export LLM_BACKEND=vllm
-export VLLM_HOST=http://localhost:8000
-export VLLM_MODEL=qwen36-awq
+# See run_robot.sh for migration history (s1 → vllm0528, 2026-05-28).
+export VLLM_HOST=${VLLM_HOST:-vllm0528}
+export VLLM_PORT=${VLLM_PORT:-8000}
+export VLLM_MODEL=${VLLM_MODEL:-qwen36-awq}
 
 # Keep these as fallback (LLM_MODE=ollama means ollama route is used; the
 # dispatch then checks LLM_BACKEND inside the route)
@@ -31,7 +33,9 @@ export OLLAMA_MODEL=qwen3.6:35b-a3b
 export OLLAMA_THINK=0
 
 # Vision: use the same backend (vLLM serves the same multimodal model)
-export VISION_URL=$VLLM_HOST
+# VISION_URL must be the same vLLM endpoint as chat (unified MoE serves both).
+# VLLM_HOST is now bare; reconstruct full URL here.
+export VISION_URL="http://${VLLM_HOST}:${VLLM_PORT}"
 export VISION_MODEL=$VLLM_MODEL
 export VISION_INTERVAL=10        # vLLM concurrent batching makes 30s overkill; 10s = fresher scene
 export LLM_STREAMING=1
