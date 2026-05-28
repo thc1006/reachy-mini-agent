@@ -2638,7 +2638,13 @@ def _patch_sdk_signalling_host():
     connect to, which IS the routeable address by construction).
 
     Insert before any ReachyMini() instantiation. Idempotent.
+
+    Opt-in via REACHY_MEDIA_REMOTE env (split-compute only). When brain runs
+    co-located on the Pi, SDK auto-detects localhost correctly and this patch
+    would actively misroute; set REACHY_MEDIA_REMOTE=1 to re-enable.
     """
+    if not os.getenv("REACHY_MEDIA_REMOTE", "").strip():
+        return
     try:
         from reachy_mini.media import media_manager as _mm
     except Exception as e:
