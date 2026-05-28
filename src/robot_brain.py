@@ -25,6 +25,14 @@ import time
 # Self-contained module: pure helpers + thin SDK glue. See src/elder_care.py.
 import elder_care
 
+# Observability bundle (D2-OBS-BRAIN): structlog JSON logger, faulthandler,
+# per-thread heartbeat + gated systemd watchdog, Prometheus metrics +
+# exporter, pybreaker/tenacity wrappers for HTTP backends. All pieces
+# degrade to no-op if optional deps (structlog, prometheus_client,
+# pybreaker, tenacity) are missing, so brain stays bootable on stripped
+# venvs.
+import brain_observability as obs
+
 # CUDA 穩定性：lazy load 減記憶體碎片、CUDA 0 固定
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -82,6 +90,11 @@ def _sd_notify(state: str) -> None:
             _sd_notifier.notify(state)
         except Exception:
             pass
+
+# ── 結構化 logger（structlog JSON → stderr → journald）─────────────────────
+# Initialized at import time so module-level code that wants to log can.
+# If structlog is missing, falls back to _PrintLogger (stderr key=value).
+logger = obs.configure_structlog()
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 HOST             = os.getenv("REACHY_HOST", "reachy-mini.local")   # mDNS by default; override via env
@@ -416,8 +429,19 @@ def get_state() -> State:
 def set_state(s: State):
     global _state
     with _state_lock:
+        old = _state
         _state = s
     print(f"  [狀態] → {s.value}")
+    try:
+        obs.state_transitions.labels(
+            from_state=getattr(old, "value", str(old)),
+            to_state=s.value,
+        ).inc()
+        logger.info("state_transition",
+                    from_state=getattr(old, "value", str(old)),
+                    to_state=s.value)
+    except Exception:
+        pass
 
 # ── MediaPipe 手部偵測（CPU, 小巧, 每 3 幀跑一次）───────────────────────────
 HAND_MODEL_PATH = "hand_landmarker.task"
@@ -525,6 +549,7 @@ def hand_worker(mini, stop_event: threading.Event):
     last_recreate = time.time()
     print(f"  [手勢 worker] 啟動 (5 Hz, recreate every {RECREATE_S:.0f}s)")
     while not stop_event.is_set():
+        obs.pulse("hand_worker")
         time.sleep(0.2)  # 5 Hz (was 0.1 / 10 Hz pre-Wave3-P2)
         # Early state-gate: skip cv2 colour-convert + mediapipe detect when
         # brain isn't actively engaged. IDLE / CONVERSATION / COOLDOWN don't
@@ -597,6 +622,7 @@ def vision_worker(stop_event: threading.Event):
     print(f"  [視覺 worker] 啟動（{VISION_MODEL} @ {VISION_URL}, every {VISION_INTERVAL}s）")
     global _scene_desc, _scene_desc_t
     while not stop_event.is_set():
+        obs.pulse("vision_worker")
         time.sleep(VISION_INTERVAL)
         state = get_state()
         # Run vision in TRACKING / GREETING / CONVERSATION. With vLLM's
@@ -790,24 +816,30 @@ def _to_stereo_16k(data: np.ndarray, sr: int) -> np.ndarray:
 KOKORO_URL   = os.getenv("KOKORO_URL", "http://localhost:8880")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")   # 最甜最高音（af_heart > af_nicole > af_sky > af_bella）
 
+def _fetch_kokoro_tts_inner(text: str):
+    t0 = time.perf_counter()
+    req = _urlreq.Request(
+        f"{KOKORO_URL}/v1/audio/speech",
+        data=json.dumps({"input": text, "voice": KOKORO_VOICE}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with _urlreq.urlopen(req, timeout=8) as resp:
+        wav_bytes = resp.read()
+        gen_ms = resp.headers.get("x-generation-ms", "?")
+    data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    print(f"  [TTS kokoro/{KOKORO_VOICE}] {(time.perf_counter()-t0)*1000:.0f}ms (GPU gen={gen_ms}ms, {len(wav_bytes)}B)")
+    return data, sr
+
+
 def _fetch_kokoro_tts(text: str):
+    """同步從 5090 Kokoro 拉 wav bytes → (samples, sr)，失敗回 None。
+    Wrapped with pybreaker so a Kokoro outage doesn't burn 8 s × every TTS call
+    on timeouts — circuit opens after 5 fails, edge-tts fallback kicks in."""
     text = _strip_emoji(text)   # 雙保險：即使被直接呼叫也 strip
     if not text:
         return None
-    """同步從 5090 Kokoro 拉 wav bytes → (samples, sr)，失敗回 None"""
     try:
-        t0 = time.perf_counter()
-        req = _urlreq.Request(
-            f"{KOKORO_URL}/v1/audio/speech",
-            data=json.dumps({"input": text, "voice": KOKORO_VOICE}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with _urlreq.urlopen(req, timeout=8) as resp:
-            wav_bytes = resp.read()
-            gen_ms = resp.headers.get("x-generation-ms", "?")
-        data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
-        print(f"  [TTS kokoro/{KOKORO_VOICE}] {(time.perf_counter()-t0)*1000:.0f}ms (GPU gen={gen_ms}ms, {len(wav_bytes)}B)")
-        return data, sr
+        return obs.call_with_breaker("kokoro", _fetch_kokoro_tts_inner, text)
     except Exception as e:
         print(f"  [TTS kokoro 失敗] {e}，fallback edge-tts")
         return None
@@ -1153,9 +1185,21 @@ def speak(mini, text: str):
         return
     try:
         asyncio.run(_stream_tts(clean, mini))
-        print(f"  [TTS total] {(time.perf_counter()-t0)*1000:.0f}ms ({len(text)} chars)")
+        dur = time.perf_counter() - t0
+        print(f"  [TTS total] {dur*1000:.0f}ms ({len(text)} chars)")
+        try:
+            obs.tts_latency.observe(dur)
+            logger.info("tts_done",
+                        chars=len(text),
+                        latency_ms=int(dur * 1000))
+        except Exception:
+            pass
     except Exception as e:
         print(f"  [TTS 錯誤] {e}")
+        try:
+            logger.error("tts_error", err=str(e), chars=len(text))
+        except Exception:
+            pass
 
 # ── Echo-loop 防護: TTS 期間 mic gating ─────────────────────────────────
 # Bug fixed: 之前 TTS 播放時 mic 也在錄、speaker → mic 環路被 VAD 觸發 →
@@ -1385,18 +1429,43 @@ def _transcribe_local(audio: np.ndarray) -> str:
         return ""
 
 def transcribe(audio: np.ndarray) -> str:
+    _t_stt = time.perf_counter()
     with _whisper_lock:
-        text = _transcribe_via_5090(audio)
+        # Wrap remote-whisper through pybreaker so repeated 5xx / timeout
+        # bursts open the circuit and we stop hammering the s1 server.
+        try:
+            text = obs.call_with_breaker("whisper", _transcribe_via_5090, audio)
+        except Exception as e:
+            try:
+                logger.warning("stt_breaker_open_or_retry_exhausted", err=str(e))
+            except Exception:
+                pass
+            text = None
         if text is None:
             # Local fallback only when faster_whisper was loaded. In remote-only
             # mode (brain-on-Pi, _WHISPER_BACKEND == "remote-only"), the local
             # path is None and would AttributeError — treat remote miss as silence.
             if whisper_model is None:
+                try:
+                    obs.stt_latency.observe(time.perf_counter() - _t_stt)
+                    logger.info("stt_empty", reason="remote_only_remote_miss",
+                                audio_s=round(len(audio) / SAMPLE_RATE, 2))
+                except Exception:
+                    pass
                 return ""
             text = _transcribe_local(audio)
         # Normalize Whisper's zh-CN-leaning output back to zh-TW for display +
         # downstream logging consistency. Idempotent for already-traditional text.
-        return to_zh_tw(text)
+        out = to_zh_tw(text)
+        try:
+            obs.stt_latency.observe(time.perf_counter() - _t_stt)
+            logger.info("stt_done",
+                        audio_s=round(len(audio) / SAMPLE_RATE, 2),
+                        chars=len(out),
+                        latency_ms=int((time.perf_counter() - _t_stt) * 1000))
+        except Exception:
+            pass
+        return out
 
 # ── LLM（Claude CLI）─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
@@ -1814,10 +1883,33 @@ def _llm_chat_payload(payload: dict) -> dict:
 
 def _ask_via_ollama(text: str) -> dict:
     """Ollama native /api/chat，支援 S5 tool calling multi-turn loop。
-    當 LLM_BACKEND=vllm 時自動 dispatch 到 vLLM endpoint（payload/response 雙向轉換）。"""
+    當 LLM_BACKEND=vllm 時自動 dispatch 到 vLLM endpoint（payload/response 雙向轉換）。
+
+    Wrapped with pybreaker (5 fails / 30 s reset) + tenacity (3 attempts,
+    0.5-2 s exponential) when LLM_BACKEND=vllm. Circuit-open or retry-exhausted
+    paths return the canned "嗯…我想想" so the user always hears something
+    instead of dead silence."""
     _llm_dialog_active.set()
+    _t_llm = time.perf_counter()
     try:
-        return _ask_via_ollama_inner(text)
+        if LLM_BACKEND == "vllm":
+            try:
+                result = obs.call_with_breaker("vllm", _ask_via_ollama_inner, text)
+            except Exception as e:
+                try:
+                    logger.error("llm_breaker_open_or_retry_exhausted",
+                                 err=str(e), backend="vllm",
+                                 circuit_open=obs.is_circuit_open("vllm"))
+                except Exception:
+                    pass
+                result = {"speech": obs.CANNED_FALLBACK_PHRASE, "actions": []}
+        else:
+            result = _ask_via_ollama_inner(text)
+        try:
+            obs.llm_latency.observe(time.perf_counter() - _t_llm)
+        except Exception:
+            pass
+        return result
     finally:
         _llm_dialog_active.clear()
 
@@ -2369,9 +2461,14 @@ def do_conversation(mini):
     noise_skips = 0          # 連續 noise 過濾計數，防止噪音環境卡死在 CONVERSATION
     MAX_NOISE_SKIPS = 3
     while get_state() == State.CONVERSATION and turns < 5:
+        obs.pulse("dialog_loop")
         audio = record_utterance(mini)
         if audio is None:
             speak(mini, "沒事，隨時來找我聊聊。")
+            try:
+                obs.dialog_outcome.labels(result="no_audio").inc()
+            except Exception:
+                pass
             break
         t_turn = time.perf_counter()
         text = transcribe(audio)
@@ -2384,8 +2481,22 @@ def do_conversation(mini):
         if elder_care.elder_mode_enabled():
             _emerg = elder_care.is_emergency(text)
             if _emerg:
+                # NOTE: emergency path runs even if vLLM circuit is open
+                # (handle_emergency uses TTS + webhook only, no LLM call) — the
+                # canned-phrase fallback for LLM does NOT mask elder-care
+                # emergencies because this branch fires BEFORE _ask_llm.
+                try:
+                    obs.emergency_phrase.labels(phrase=str(_emerg)[:40]).inc()
+                    logger.warning("emergency_phrase_matched",
+                                   phrase=str(_emerg)[:40], text=text[:120])
+                except Exception:
+                    pass
                 elder_care.handle_emergency(text, _emerg, speak_fn=speak, mini=mini)
                 _log_turn(text, elder_care.emergency_ack_text(text))
+                try:
+                    obs.dialog_outcome.labels(result="emergency").inc()
+                except Exception:
+                    pass
                 turns += 1
                 continue
         if not _is_meaningful_utterance(text):
@@ -2393,6 +2504,10 @@ def do_conversation(mini):
             print(f"  [噪音過濾 {noise_skips}/{MAX_NOISE_SKIPS}] '{text}' → 略過")
             if noise_skips >= MAX_NOISE_SKIPS:
                 print(f"  [噪音環境] 連續 {MAX_NOISE_SKIPS} 次過濾，退出對話")
+                try:
+                    obs.dialog_outcome.labels(result="noise_fallback").inc()
+                except Exception:
+                    pass
                 break
             continue
         noise_skips = 0   # 有實質輸入就重置計數
@@ -2410,7 +2525,18 @@ def do_conversation(mini):
             resp    = ask_llm(text)
             speech  = resp.get("speech", "") or ""
             actions = resp.get("actions", []) or []
-        print(f"  [輪總耗時] STT+LLM+TTS = {(time.perf_counter()-t_turn)*1000:.0f}ms")
+        turn_dur = time.perf_counter() - t_turn
+        print(f"  [輪總耗時] STT+LLM+TTS = {turn_dur*1000:.0f}ms")
+        try:
+            obs.pipeline_e2e.observe(turn_dur)
+            obs.dialog_outcome.labels(result="completed").inc()
+            logger.info("dialog_turn_done",
+                        e2e_ms=int(turn_dur * 1000),
+                        user_chars=len(text),
+                        reply_chars=len(speech) if speech else 0,
+                        streamed=streamed)
+        except Exception:
+            pass
         if actions:
             threading.Thread(target=lambda a=actions: [do_action(mini, x) for x in a], daemon=True).start()
         if not streamed and speech:
@@ -2502,6 +2628,7 @@ def tracking_loop(mini, stop_event: threading.Event):
 
     print("  [追蹤] 啟動")
     while not stop_event.is_set():
+        obs.pulse("tracking_loop")
         state = get_state()
 
         # ── COOLDOWN 計時（同時繼續追蹤臉，不要呆坐著）─────────────────────
@@ -2807,6 +2934,14 @@ def _patch_sdk_signalling_host():
 
 
 def main():
+    # ── Observability bootstrap (early so faulthandler catches startup hangs) ──
+    obs.enable_faulthandler(interval_s=60)
+    obs.start_metrics_exporter(logger)
+    logger.info("brain_startup_begin",
+                host=HOST,
+                llm_backend=os.getenv("LLM_BACKEND", "ollama"),
+                elder_mode=os.getenv("ELDER_CARE_MODE", "0"))
+
     _load_conv_memory()   # ← 啟動時載入 JSONL 歷史
     _prewarm_vllm()       # ← prime vLLM prefix cache before first user turn
     _patch_sdk_signalling_host()
@@ -2841,14 +2976,31 @@ def main():
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")
         _sd_notify("READY=1")
+        logger.info("brain_ready",
+                    threads=["tracking_loop", "hand_worker", "vision_worker"],
+                    mic=mic_src)
+
+        # Start the gated watchdog thread: every 10 s it checks the oldest
+        # per-thread heartbeat; if any registered worker has been silent for
+        # >60 s it STOPS notifying systemd, so WatchdogSec=120 trips and the
+        # unit restarts cleanly. Replaces the old unconditional 30 s pulse
+        # that kept the unit "alive" even when GStreamer / gupnp had every
+        # worker thread deadlocked.
+        obs.start_watchdog_thread(
+            sd_notify_fn=_sd_notify,
+            stop_event=stop_event,
+            logger=logger,
+        )
+        # Seed heartbeats for the main loop so the watchdog has something to
+        # check immediately (workers may take a few seconds to pulse).
+        for _name in ("tracking_loop", "hand_worker", "vision_worker",
+                      "dialog_loop", "main_idle"):
+            obs.pulse(_name)
 
         try:
-            last_watchdog = time.monotonic()
             while True:
                 time.sleep(0.5)
-                if time.monotonic() - last_watchdog >= 30.0:
-                    _sd_notify("WATCHDOG=1")
-                    last_watchdog = time.monotonic()
+                obs.pulse("main_idle")
         except KeyboardInterrupt:
             print("\n關閉中...")
         finally:
