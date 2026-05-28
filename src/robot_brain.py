@@ -2643,7 +2643,8 @@ def _patch_sdk_signalling_host():
     co-located on the Pi, SDK auto-detects localhost correctly and this patch
     would actively misroute; set REACHY_MEDIA_REMOTE=1 to re-enable.
     """
-    if not os.getenv("REACHY_MEDIA_REMOTE", "").strip():
+    _v = os.getenv("REACHY_MEDIA_REMOTE", "").strip().lower()
+    if _v in ("", "0", "false", "no", "off"):
         return
     try:
         from reachy_mini.media import media_manager as _mm
