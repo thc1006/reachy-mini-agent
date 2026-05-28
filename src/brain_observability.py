@@ -97,8 +97,19 @@ def enable_faulthandler(interval_s: int = _FAULTHANDLER_INTERVAL_S) -> None:
 
 
 # ── 3. Per-thread heartbeat + watchdog ──────────────────────────────────────
-WATCHDOG_THRESHOLD_S = float(os.getenv("BRAIN_WATCHDOG_THRESHOLD_S", "60"))
+# Default 90 s (raised from 60 s) — vision_worker's slow VL HTTP call to
+# vllm0528 can legitimately take 30-60 s; a 60 s ceiling would mark a healthy
+# worker stale mid-call. The watchdog still tightens systemd's 120 s
+# WatchdogSec, just with more headroom for the slowest legitimate work.
+WATCHDOG_THRESHOLD_S = float(os.getenv("BRAIN_WATCHDOG_THRESHOLD_S", "90"))
 WATCHDOG_INTERVAL_S = float(os.getenv("BRAIN_WATCHDOG_INTERVAL_S", "10"))
+# After the seeding loop completes, main() flips `_watchdog_armed_at`. Before
+# that point the watchdog tolerates "no heartbeats yet" without complaint.
+# Once armed, if 30 s elapse with still no heartbeats, the watchdog treats
+# that as a stale state (suspect every worker thread died during startup)
+# and STOPS sending WATCHDOG=1 so systemd restarts the unit.
+_watchdog_armed_at: Optional[float] = None
+_WATCHDOG_POST_ARM_GRACE_S = 30.0
 
 _thread_heartbeat: dict[str, float] = {}
 _heartbeat_lock = threading.Lock()
@@ -135,15 +146,26 @@ def heartbeat_min_age_s() -> Optional[float]:
     return now - min(snap.values())
 
 
+def arm_watchdog() -> None:
+    """Mark the moment after which the watchdog should expect at least one
+    heartbeat within _WATCHDOG_POST_ARM_GRACE_S. Call from main() AFTER
+    workers have been seeded with their first pulse() — see robot_brain.main()."""
+    global _watchdog_armed_at
+    _watchdog_armed_at = time.monotonic()
+
+
 def start_watchdog_thread(
     sd_notify_fn: Callable[[str], None],
     stop_event: threading.Event,
     logger: object,
     threshold_s: float = WATCHDOG_THRESHOLD_S,
     interval_s: float = WATCHDOG_INTERVAL_S,
-) -> threading.Thread:
+) -> Optional[threading.Thread]:
     """Start the gated watchdog. Every interval_s it:
-      - If no heartbeats registered yet → send WATCHDOG=1 (startup grace)
+      - If NOTIFY_SOCKET unset → no-op (dev / non-systemd runs); return None
+      - If no heartbeats registered yet AND <30 s since arm → send WATCHDOG=1
+        (startup grace window for workers to register first pulse)
+      - If no heartbeats registered AND >=30 s since arm → STALE, do NOT notify
       - If oldest heartbeat age < threshold_s → send WATCHDOG=1
       - Else: SKIP sending, let systemd WatchdogSec time out and restart.
 
@@ -151,6 +173,15 @@ def start_watchdog_thread(
     cheerfully keep notifying systemd while every worker thread was deadlocked
     inside GStreamer / gupnp.
     """
+    if "NOTIFY_SOCKET" not in os.environ:
+        # Not under systemd notify supervision — the watchdog has nothing to
+        # protect (no WatchdogSec timeout to head off, no journald audience).
+        # Log once at INFO so dev runs make this visible, then bail.
+        try:
+            logger.info("watchdog_disabled_no_systemd")
+        except Exception:
+            pass
+        return None
 
     def _run():
         try:
@@ -161,7 +192,21 @@ def start_watchdog_thread(
         while not stop_event.is_set():
             try:
                 age = heartbeat_min_age_s()
-                if age is None or age < threshold_s:
+                armed_at = _watchdog_armed_at
+                if age is None:
+                    # No heartbeats yet — tolerate during startup grace, but
+                    # once we've been armed for >grace, treat as stale.
+                    if armed_at is not None and (time.monotonic() - armed_at) > _WATCHDOG_POST_ARM_GRACE_S:
+                        try:
+                            logger.error("watchdog_stale_post_grace",
+                                         grace_s=_WATCHDOG_POST_ARM_GRACE_S,
+                                         armed_age_s=round(time.monotonic() - armed_at, 1))
+                        except Exception:
+                            pass
+                        # Skip notify — let systemd WatchdogSec trip
+                    else:
+                        sd_notify_fn("WATCHDOG=1")
+                elif age < threshold_s:
                     sd_notify_fn("WATCHDOG=1")
                 else:
                     # Stale — let systemd kill us. Log so the journald entry
@@ -218,6 +263,12 @@ emergency_phrase: object = _NoOpMetric()
 dialog_outcome: object = _NoOpMetric()
 pipeline_e2e: object = _NoOpMetric()
 backend_circuit_open: object = _NoOpMetric()
+# Fallback / empty-result counters — incremented INSTEAD of recording near-0
+# histogram observations on fallback branches (canned phrase, empty STT,
+# silent TTS), so the latency histograms reflect real backend work only.
+llm_fallback_total: object = _NoOpMetric()
+stt_fallback_total: object = _NoOpMetric()
+tts_fallback_total: object = _NoOpMetric()
 
 _metrics_initialized = False
 _metrics_init_lock = threading.Lock()
@@ -227,6 +278,7 @@ def init_metrics() -> bool:
     """Define + register all Prometheus metrics. Returns True on success."""
     global state_transitions, stt_latency, llm_latency, tts_latency
     global emergency_phrase, dialog_outcome, pipeline_e2e, backend_circuit_open
+    global llm_fallback_total, stt_fallback_total, tts_fallback_total
     global _metrics_initialized
     if not _HAS_PROMETHEUS:
         return False
@@ -276,6 +328,21 @@ def init_metrics() -> bool:
                 "1 if pybreaker circuit is open (backend degraded)",
                 ["backend"],
             )
+            llm_fallback_total = Counter(
+                "brain_llm_fallback_total",
+                "LLM call fell back to canned phrase / empty result",
+                ["reason"],
+            )
+            stt_fallback_total = Counter(
+                "brain_stt_fallback_total",
+                "STT call returned empty / fell back to silence",
+                ["reason"],
+            )
+            tts_fallback_total = Counter(
+                "brain_tts_fallback_total",
+                "TTS call skipped / errored without playing",
+                ["reason"],
+            )
             _metrics_initialized = True
             return True
         except Exception as e:
@@ -306,10 +373,14 @@ def start_metrics_exporter(logger: object) -> bool:
         except Exception:
             pass
         return True
-    except OSError as e:
+    except (OSError, PermissionError) as e:
+        # PermissionError is a subclass of OSError on POSIX but we list it
+        # explicitly so the intent (port < 1024 / SELinux bind denial) is
+        # documented; either variant is logged with the exception class.
         try:
             logger.error("prometheus_exporter_port_busy",
-                         port=port, addr=addr, err=str(e))
+                         port=port, addr=addr,
+                         err=str(e), err_class=type(e).__name__)
         except Exception:
             pass
         return False
@@ -332,16 +403,23 @@ except ImportError:
 try:
     from tenacity import (
         retry, stop_after_attempt, wait_exponential,
-        retry_if_exception_type,
+        retry_if_exception_type, retry_if_not_exception_type,
     )
     _HAS_TENACITY = True
 except ImportError:
     retry = None
+    retry_if_not_exception_type = None
     _HAS_TENACITY = False
 
 
 _breakers: dict[str, object] = {}
 _breaker_lock = threading.Lock()
+# Hot-path cache: the three production backends are read every dialog turn —
+# fetching them through the lock on every call_with_breaker is wasted
+# contention. Populated lazily on first get_breaker() for these names; reads
+# of the cache are lock-free (dict.get is atomic for str keys in CPython).
+_KNOWN_BACKENDS = frozenset({"vllm", "whisper", "kokoro"})
+_breaker_cache: dict[str, object] = {}
 
 
 class _NoOpBreaker:
@@ -354,12 +432,23 @@ class _NoOpBreaker:
 
 def get_breaker(name: str, fail_max: int = 5, reset_timeout_s: int = 30) -> object:
     """Get-or-create a circuit breaker for the named backend. On open, the
-    Prometheus brain_backend_circuit_open{backend=name} gauge flips to 1."""
+    Prometheus brain_backend_circuit_open{backend=name} gauge flips to 1.
+
+    Hot-path: for the three known backends (vllm/whisper/kokoro) the cached
+    breaker is returned lock-free once populated. Unknown names still take the
+    lock for safety.
+    """
+    if name in _KNOWN_BACKENDS:
+        cached = _breaker_cache.get(name)
+        if cached is not None:
+            return cached
     with _breaker_lock:
         if name in _breakers:
             return _breakers[name]
         if not _HAS_PYBREAKER:
             _breakers[name] = _NoOpBreaker()
+            if name in _KNOWN_BACKENDS:
+                _breaker_cache[name] = _breakers[name]
             return _breakers[name]
         try:
             class _Listener(pybreaker.CircuitBreakerListener):
@@ -377,6 +466,8 @@ def get_breaker(name: str, fail_max: int = 5, reset_timeout_s: int = 30) -> obje
                 name=name,
             )
             _breakers[name] = cb
+            if name in _KNOWN_BACKENDS:
+                _breaker_cache[name] = cb
             try:
                 backend_circuit_open.labels(backend=name).set(0)
             except Exception:
@@ -385,6 +476,8 @@ def get_breaker(name: str, fail_max: int = 5, reset_timeout_s: int = 30) -> obje
         except Exception as e:
             print(f"[obs] get_breaker({name}) failed: {e}", file=sys.stderr, flush=True)
             _breakers[name] = _NoOpBreaker()
+            if name in _KNOWN_BACKENDS:
+                _breaker_cache[name] = _breakers[name]
             return _breakers[name]
 
 
@@ -402,10 +495,23 @@ def call_with_breaker(name: str, fn: Callable, *args, **kwargs):
     if not _HAS_TENACITY:
         return breaker.call(fn, *args, **kwargs)
 
+    # H-O3 fix: tenacity's default `retry_if_exception_type(Exception)` would
+    # also retry on pybreaker.CircuitBreakerError, which defeats the breaker
+    # (we'd wait + try again instead of failing fast). Compose with
+    # retry_if_not_exception_type so CircuitBreakerError raises immediately
+    # and the caller can return the canned-phrase fallback.
+    if _HAS_PYBREAKER:
+        retry_pred = (
+            retry_if_exception_type(Exception)
+            & retry_if_not_exception_type(pybreaker.CircuitBreakerError)
+        )
+    else:
+        retry_pred = retry_if_exception_type(Exception)
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
-        retry=retry_if_exception_type(Exception),
+        retry=retry_pred,
         reraise=True,
     )
     def _attempt():
@@ -428,4 +534,7 @@ def is_circuit_open(name: str) -> bool:
         return False
 
 
-CANNED_FALLBACK_PHRASE = "嗯…我想想。"
+# Spoken when the vLLM call fails / circuit is open. Overridable per
+# deployment via BRAIN_LLM_FALLBACK_PHRASE — useful for English-first deploys
+# ("Let me think…") or shorter strings.
+CANNED_FALLBACK_PHRASE = os.getenv("BRAIN_LLM_FALLBACK_PHRASE", "嗯…我想想。")

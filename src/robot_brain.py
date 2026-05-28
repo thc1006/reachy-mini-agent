@@ -678,6 +678,12 @@ def vision_worker(stop_event: threading.Event):
             )
             with _vreq.urlopen(req, timeout=40) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
+            # H-O4 fix: pulse AGAIN right after the slow VL HTTP call returns
+            # so a long (30-60 s) but successful inference doesn't leave the
+            # heartbeat as old as `before-call` for an entire VISION_INTERVAL
+            # cycle. Without this, a single slow call followed by the sleep()
+            # could push min-age past the 90 s watchdog threshold.
+            obs.pulse("vision_worker")
             data = (
                 _openai_to_ollama_response(raw) if LLM_BACKEND == "vllm" else raw
             )
@@ -1182,6 +1188,12 @@ def speak(mini, text: str):
     else:
         print(f"  [說話] {clean}")
     if not clean:
+        # M-O2: TTS skipped (empty after emoji strip) — record as fallback,
+        # not as a 0 ms latency observation that would skew the histogram.
+        try:
+            obs.tts_fallback_total.labels(reason="empty_after_clean").inc()
+        except Exception:
+            pass
         return
     try:
         asyncio.run(_stream_tts(clean, mini))
@@ -1197,6 +1209,7 @@ def speak(mini, text: str):
     except Exception as e:
         print(f"  [TTS 錯誤] {e}")
         try:
+            obs.tts_fallback_total.labels(reason="exception").inc()
             logger.error("tts_error", err=str(e), chars=len(text))
         except Exception:
             pass
@@ -1446,8 +1459,10 @@ def transcribe(audio: np.ndarray) -> str:
             # mode (brain-on-Pi, _WHISPER_BACKEND == "remote-only"), the local
             # path is None and would AttributeError — treat remote miss as silence.
             if whisper_model is None:
+                # M-O2: do NOT record the near-0 ms fallback in the latency
+                # histogram (skews p50/p95). Bump the fallback counter instead.
                 try:
-                    obs.stt_latency.observe(time.perf_counter() - _t_stt)
+                    obs.stt_fallback_total.labels(reason="remote_only_remote_miss").inc()
                     logger.info("stt_empty", reason="remote_only_remote_miss",
                                 audio_s=round(len(audio) / SAMPLE_RATE, 2))
                 except Exception:
@@ -1891,6 +1906,8 @@ def _ask_via_ollama(text: str) -> dict:
     instead of dead silence."""
     _llm_dialog_active.set()
     _t_llm = time.perf_counter()
+    used_fallback = False
+    fallback_reason = ""
     try:
         if LLM_BACKEND == "vllm":
             try:
@@ -1902,11 +1919,19 @@ def _ask_via_ollama(text: str) -> dict:
                                  circuit_open=obs.is_circuit_open("vllm"))
                 except Exception:
                     pass
+                used_fallback = True
+                fallback_reason = "circuit_open" if obs.is_circuit_open("vllm") else "retry_exhausted"
                 result = {"speech": obs.CANNED_FALLBACK_PHRASE, "actions": []}
         else:
             result = _ask_via_ollama_inner(text)
+        # M-O2: only feed the latency histogram from successful inference.
+        # Canned-phrase fallbacks return in ~0 ms and would pull p50 down,
+        # masking real backend slowdowns. Count them in llm_fallback_total.
         try:
-            obs.llm_latency.observe(time.perf_counter() - _t_llm)
+            if used_fallback:
+                obs.llm_fallback_total.labels(reason=fallback_reason or "unknown").inc()
+            else:
+                obs.llm_latency.observe(time.perf_counter() - _t_llm)
         except Exception:
             pass
         return result
@@ -2460,6 +2485,12 @@ def do_conversation(mini):
     turns = 0
     noise_skips = 0          # 連續 noise 過濾計數，防止噪音環境卡死在 CONVERSATION
     MAX_NOISE_SKIPS = 3
+    # M-O4 fix: dialog_outcome="completed" is a SESSION outcome, not per-turn.
+    # We record turn-level success with the "turn_completed" label inside the
+    # loop and flip this flag so the session-level "completed" counter only
+    # increments once, on natural loop exit.
+    session_had_turn = False
+    completed_outcome_recorded = False
     while get_state() == State.CONVERSATION and turns < 5:
         obs.pulse("dialog_loop")
         audio = record_utterance(mini)
@@ -2529,7 +2560,7 @@ def do_conversation(mini):
         print(f"  [輪總耗時] STT+LLM+TTS = {turn_dur*1000:.0f}ms")
         try:
             obs.pipeline_e2e.observe(turn_dur)
-            obs.dialog_outcome.labels(result="completed").inc()
+            obs.dialog_outcome.labels(result="turn_completed").inc()
             logger.info("dialog_turn_done",
                         e2e_ms=int(turn_dur * 1000),
                         user_chars=len(text),
@@ -2537,6 +2568,7 @@ def do_conversation(mini):
                         streamed=streamed)
         except Exception:
             pass
+        session_had_turn = True
         if actions:
             threading.Thread(target=lambda a=actions: [do_action(mini, x) for x in a], daemon=True).start()
         if not streamed and speech:
@@ -2554,7 +2586,20 @@ def do_conversation(mini):
         if any(w in _t_low for w in _EN_EXIT) or any(w in text for w in _ZH_EXIT):
             speak(mini, "掰掰。")
             do_action(mini, "greet")
+            try:
+                obs.dialog_outcome.labels(result="completed").inc()
+                completed_outcome_recorded = True
+            except Exception:
+                pass
             break
+    # Session exit: if we ran turns but didn't hit the bye-branch, record the
+    # session-level "completed" outcome once. no_audio / noise_fallback /
+    # emergency branches already incremented their own labels and broke out.
+    if session_had_turn and not completed_outcome_recorded:
+        try:
+            obs.dialog_outcome.labels(result="completed").inc()
+        except Exception:
+            pass
 
 # ── 人臉追蹤 + 狀態機主迴圈 ──────────────────────────────────────────────────
 def tracking_loop(mini, stop_event: threading.Event):
@@ -3011,6 +3056,10 @@ def main():
         for _name in ("tracking_loop", "hand_worker", "vision_worker",
                       "main_idle"):
             obs.pulse(_name)
+        # ARM the watchdog AFTER seeding pulses. From this moment, if 30 s
+        # pass with still no heartbeats, the watchdog treats the brain as
+        # stuck and stops notifying systemd (so WatchdogSec restarts us).
+        obs.arm_watchdog()
 
         try:
             while True:
@@ -3020,6 +3069,13 @@ def main():
             print("\n關閉中...")
         finally:
             stop_event.set()
+            # M-O1: cancel the recurring faulthandler dump so a graceful
+            # shutdown doesn't leak a SIGALRM-driven traceback after exit.
+            try:
+                import faulthandler as _fh
+                _fh.cancel_dump_traceback_later()
+            except Exception:
+                pass
             try:
                 mini.goto_target(head=create_head_pose(z=0, mm=True),
                                  antennas=np.deg2rad([0, 0]),
