@@ -242,11 +242,17 @@ def fire_antenna_cue(mini: Any, state: str) -> bool:
     if call is None or mini is None:
         return False
     try:
-        # Defer numpy import: tests don't have a live mini either way.
-        import numpy as np
+        # numpy is the production form (matches do_action() convention), but
+        # the SDK accepts plain sequences too — fall back to a list so this
+        # function is unit-testable in CI environments without numpy.
         ants = call["antennas"]
+        try:
+            import numpy as np
+            ants_arg = np.array(ants, dtype=float)
+        except ImportError:
+            ants_arg = list(ants)
         mini.goto_target(
-            antennas=np.array(ants, dtype=float),
+            antennas=ants_arg,
             duration=call["duration"],
             method="minjerk",
         )
