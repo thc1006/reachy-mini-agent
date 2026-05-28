@@ -33,6 +33,12 @@ import elder_care
 # venvs.
 import brain_observability as obs
 
+# Wave4-P6 (#76): single source of truth for emotion/dance trigger names.
+# Replaces hardcoded lists (e.g. _VALID_ACTIONS below was a 5-name literal).
+# Now resolved at import via motion_catalog.MOTION_CATALOG, which refreshes
+# from HuggingFace once per 24h with disk cache + bundled fallback.
+from motion_catalog import MOTION_CATALOG
+
 # CUDA 穩定性：lazy load 減記憶體碎片、CUDA 0 固定
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -2212,7 +2218,19 @@ _EMOTION_PREFIX_RE = re.compile(
     r"^\s*(Happy|Nod|Shake|Think|Greet|Sad|Curious|Surprised)[\!\.\,]+\s+",
     re.IGNORECASE,
 )
-_VALID_ACTIONS = {"happy", "nod", "shake", "think", "greet"}
+# _VALID_ACTIONS: the subset of catalog names that have a LOCALLY-SCRIPTED
+# do_action() branch (vs catalog clips dispatched via the daemon by
+# _tool_play_emotion). Hard intersection with MOTION_CATALOG ensures we
+# never accept a tag the catalog has dropped — first-pass keeps the
+# original 5 names exactly; if a future rollout removes one upstream
+# we'll notice via the intersection.
+_SCRIPTED_ACTION_NAMES = ("happy", "nod", "shake", "think", "greet")
+_VALID_ACTIONS = {a for a in _SCRIPTED_ACTION_NAMES if a in MOTION_CATALOG} or set(_SCRIPTED_ACTION_NAMES)
+try:
+    logger.info("motion_catalog_loaded", entries=len(MOTION_CATALOG),
+                scripted=len(_VALID_ACTIONS))
+except Exception:
+    pass
 # Pronunciation override for the user's name — qwen3.6 defaults to the
 # Japanese reading 秀吉 → "Hideyoshi". Explicitly rewrite to the intended
 # English romanisation of the Mandarin reading.

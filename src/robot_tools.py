@@ -331,44 +331,43 @@ def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_cli
         _resync_timer.daemon = True
         _resync_timer.start()
 
-_DANCES_LIB   = "pollen-robotics/reachy-mini-dances-library"
-_EMOTIONS_LIB = "pollen-robotics/reachy-mini-emotions-library"
-
-# Dynamic discovery — query daemon's list endpoint at first use, cache result.
-# This way the catalog auto-syncs with whatever pollen-robotics publishes and
-# whatever extra datasets the user installs on the daemon. No hardcoded names.
+# Catalog of emotion + dance clips lives in src/motion_catalog.py (Wave4-P6 #76).
+# It refreshes from HuggingFace once per 24h with disk + in-process cache and
+# falls back to data/catalog_fallback.json if HF is unreachable. The exported
+# MOTION_CATALOG dict maps every triggerable name (clips + aliases + generic
+# "dance" synonyms) to a MotionSpec with the daemon play path.
 #
-# Fallback set is a minimal known-good list in case the daemon is unreachable
-# at module load time (then call retries on next invocation).
+# We keep the original _DANCES_LIB / _EMOTIONS_LIB / _EMOTION_ALIAS / helper
+# names as thin shims so motion-queue work (#73) and any other call site that
+# imports them keeps working unchanged.
+try:
+    from motion_catalog import (  # type: ignore
+        DANCES_DATASET as _DANCES_LIB,
+        EMOTIONS_DATASET as _EMOTIONS_LIB,
+        MOTION_CATALOG,
+    )
+except ImportError:  # pragma: no cover — package-style fallback
+    from .motion_catalog import (
+        DANCES_DATASET as _DANCES_LIB,
+        EMOTIONS_DATASET as _EMOTIONS_LIB,
+        MOTION_CATALOG,
+    )
+
+# Legacy fallback set kept for any external import; catalog handles the real
+# fallback now.
 _DANCE_NAMES_FALLBACK = {
     "yeah_nod", "simple_nod", "side_to_side_sway", "groovy_sway_and_roll",
     "jackson_square", "dizzy_spin", "pendulum_swing", "chicken_peck",
 }
-_dataset_cache: dict[str, set[str]] = {}
-_dataset_cache_lock = _threading.Lock()
 
 
 def _fetch_dataset_moves(dataset_full_name: str) -> set[str]:
-    """Return the set of move names available in ``dataset_full_name`` on the
-    daemon. Cached after first successful call. Empty set on failure."""
-    with _dataset_cache_lock:
-        cached = _dataset_cache.get(dataset_full_name)
-    if cached is not None:
-        return cached
-    encoded = _urlparse.quote(dataset_full_name, safe="")
-    url = f"{DAEMON_BASE}/api/move/recorded-move-datasets/list/{encoded}"
-    try:
-        req = _urlreq.Request(url)
-        with _urlreq.urlopen(req, timeout=5) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        if isinstance(data, list):
-            result = set(data)
-            with _dataset_cache_lock:
-                _dataset_cache[dataset_full_name] = result
-            return result
-    except Exception:
-        pass
-    return set()
+    """Legacy shim: return the set of clip names for ``dataset_full_name``
+    from MOTION_CATALOG. Kept so any out-of-tree caller still works."""
+    return {
+        spec.clip for spec in MOTION_CATALOG.values()
+        if spec.dataset == dataset_full_name and spec.kind in {"emotion", "dance"}
+    }
 
 
 def _get_dance_names() -> set[str]:
@@ -379,38 +378,14 @@ def _get_dance_names() -> set[str]:
 def _get_emotion_clip_names() -> set[str]:
     return _fetch_dataset_moves(_EMOTIONS_LIB)
 
-# LLM-friendly English names → emotions-library clip names. 80+ clips
-# available; this maps the common English emotion words an LLM would emit.
+
+# Legacy export: LLM-friendly English names → emotions-library clip names.
+# Backed by the catalog so it auto-stays in sync; kept as a module-level dict
+# for any caller that imports it directly.
 _EMOTION_ALIAS = {
-    "happy": "cheerful1", "cheerful": "cheerful1", "joyful": "laughing1",
-    "laugh": "laughing1", "laughing": "laughing1",
-    "sad": "sad1", "lonely": "lonely1", "downcast": "downcast1",
-    "curious": "curious1", "think": "thoughtful1", "thoughtful": "thoughtful1",
-    "greet": "welcoming1", "welcome": "welcoming1", "hello": "welcoming1",
-    "shake": "no1", "no": "no1",
-    "nod": "yes1", "yes": "yes1",
-    "surprised": "surprised1", "amazed": "amazed1",
-    "scared": "scared1", "fear": "fear1", "anxious": "anxiety1",
-    "proud": "proud1", "success": "success1", "victory": "success1",
-    "tired": "tired1", "exhausted": "exhausted1", "sleep": "sleep1",
-    "loving": "loving1", "love": "loving1", "grateful": "grateful1",
-    "confused": "confused1", "uncertain": "uncertain1",
-    "shy": "shy1", "embarrassed": "shy1",
-    "frustrated": "frustrated1", "angry": "rage1", "rage": "rage1",
-    "furious": "furious1", "annoyed": "irritated1", "irritated": "irritated1",
-    "displeased": "displeased1", "contempt": "contempt1",
-    "bored": "boredom1", "boredom": "boredom1",
-    "indifferent": "indifferent1", "uncomfortable": "uncomfortable1",
-    "relief": "relief1", "serenity": "serenity1", "calm": "calming1",
-    "enthusiastic": "enthusiastic1", "energetic": "enthusiastic1",
-    "attentive": "attentive1", "listening": "attentive1",
-    "helpful": "helpful1", "understand": "understanding1",
-    "inquiring": "inquiring1", "asking": "inquiring1",
-    "incomprehensible": "incomprehensible2", "lost": "lost1",
-    "oops": "oops1", "mistake": "oops1", "reprimand": "reprimand1",
-    "impatient": "impatient1", "resigned": "resigned1",
-    "go_away": "go_away1", "come": "come1",
-    "electric": "electric1", "dying": "dying1", "die": "dying1",
+    spec.name: spec.clip
+    for spec in MOTION_CATALOG.values()
+    if spec.kind == "alias"
 }
 
 
