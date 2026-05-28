@@ -2790,7 +2790,15 @@ def tracking_loop(mini, stop_event: threading.Event):
                         do_action(mini, ga)
                         if g:
                             speak(mini, g)
-                        do_conversation(mini)
+                        try:
+                            do_conversation(mini)
+                        finally:
+                            # Drop dialog_loop heartbeat so the watchdog
+                            # doesn't treat the now-exited ephemeral thread
+                            # as a stale always-on worker. tracking/hand/
+                            # vision/main_idle keep pulsing — those ARE
+                            # always-on.
+                            obs.clear_pulse("dialog_loop")
                         cooldown_start = time.time()  # 對話結束才開始計時
                         set_state(State.COOLDOWN)
                     threading.Thread(target=greet_and_talk, daemon=True).start()
@@ -2991,10 +2999,17 @@ def main():
             stop_event=stop_event,
             logger=logger,
         )
-        # Seed heartbeats for the main loop so the watchdog has something to
-        # check immediately (workers may take a few seconds to pulse).
+        # Seed heartbeats for the ALWAYS-ON workers + main idle so the
+        # watchdog has something to check immediately (workers may take a
+        # few seconds to register their own first pulse).
+        # NOTE: dialog_loop is intentionally NOT seeded — it only runs INSIDE
+        # do_conversation() (a few seconds per turn). Seeding it would mark
+        # the dialog thread as stale after WATCHDOG_THRESHOLD_S of idle (no
+        # conversation), incorrectly tripping the systemd watchdog. It
+        # registers itself on first pulse when a real conversation begins;
+        # if a turn hangs >60 s the watchdog correctly gates — that's intent.
         for _name in ("tracking_loop", "hand_worker", "vision_worker",
-                      "dialog_loop", "main_idle"):
+                      "main_idle"):
             obs.pulse(_name)
 
         try:

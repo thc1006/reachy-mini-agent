@@ -111,6 +111,14 @@ def pulse(name: str) -> None:
         _thread_heartbeat[name] = time.monotonic()
 
 
+def clear_pulse(name: str) -> None:
+    """Remove a heartbeat registration — use for ephemeral threads (e.g.
+    dialog_loop) when they exit, so the watchdog stops treating them as
+    'always-on' workers that must keep pulsing."""
+    with _heartbeat_lock:
+        _thread_heartbeat.pop(name, None)
+
+
 def heartbeat_snapshot() -> dict[str, float]:
     """Return a copy of the per-thread heartbeat dict (monotonic timestamps)."""
     with _heartbeat_lock:
