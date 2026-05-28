@@ -65,6 +65,12 @@ FALLBACK_PATH = Path(
 HF_API_TIMEOUT_S = 5.0
 HF_API_TREE_URL = "https://huggingface.co/api/datasets/{dataset}/tree/main"
 
+# H-M1: backoff window after an HF failure so we don't hammer the API
+# during an outage. Starts at HF_FAILURE_BACKOFF_MIN_S, doubles on each
+# consecutive failure up to HF_FAILURE_BACKOFF_MAX_S, resets on success.
+HF_FAILURE_BACKOFF_MIN_S = 60.0
+HF_FAILURE_BACKOFF_MAX_S = 30 * 60.0  # 30 min ceiling
+
 
 @dataclasses.dataclass(frozen=True)
 class MotionSpec:
@@ -166,19 +172,31 @@ def _fresh(cache: dict, now: float) -> bool:
     return (now - float(ts)) < CATALOG_TTL_S
 
 
-def _fetch_from_hf(fallback: dict) -> dict:
-    """Try HF; fall back to bundled lists per-dataset on failure."""
-    emotions = _hf_list_clips(EMOTIONS_DATASET) or list(fallback.get("emotions", []))
-    dances = _hf_list_clips(DANCES_DATASET) or list(fallback.get("dances", []))
-    return {
+def _fetch_from_hf(fallback: dict) -> tuple[dict, bool]:
+    """Try HF; fall back to bundled lists per-dataset on failure.
+
+    Returns (raw_dict, hf_ok). hf_ok is True iff at least one dataset
+    returned a non-empty list — the caller uses this to decide whether
+    to stamp _fetched_at (H-M1: don't poison the 24h cache with a
+    failure result)."""
+    hf_emotions = _hf_list_clips(EMOTIONS_DATASET)
+    hf_dances = _hf_list_clips(DANCES_DATASET)
+    emotions = hf_emotions or list(fallback.get("emotions", []))
+    dances = hf_dances or list(fallback.get("dances", []))
+    hf_ok = bool(hf_emotions) or bool(hf_dances)
+    raw = {
         "emotions": emotions,
         "dances": dances,
         "aliases": dict(fallback.get("aliases", {})),
         "generic_dance_synonyms": list(fallback.get("generic_dance_synonyms", ["dance"])),
         "default_dance": fallback.get("default_dance", "yeah_nod"),
-        "_fetched_at": time.time(),
-        "_source": "hf+fallback_aliases",
+        "_source": "hf+fallback_aliases" if hf_ok else "fallback_only",
     }
+    if hf_ok:
+        raw["_fetched_at"] = time.time()
+    # If HF failed completely we deliberately omit _fetched_at so the
+    # next load_catalog() call retries (after the backoff window).
+    return raw, hf_ok
 
 
 def _build_catalog(raw: dict) -> dict[str, MotionSpec]:
@@ -233,11 +251,35 @@ def _build_catalog(raw: dict) -> dict[str, MotionSpec]:
 
 _lock = threading.Lock()
 _loaded_raw: Optional[dict] = None
+# H-M1: backoff state. _hf_failed_at is wall-time of the most recent HF
+# failure; _hf_consecutive_failures drives exponential backoff. Both
+# reset to 0 / None on the next successful HF call.
+_hf_failed_at: float = 0.0
+_hf_consecutive_failures: int = 0
+
+
+def _hf_backoff_active(now: float) -> bool:
+    """True iff we should skip the HF call because we recently failed.
+    Backoff doubles per consecutive failure, capped at HF_FAILURE_BACKOFF_MAX_S.
+    """
+    if _hf_failed_at <= 0 or _hf_consecutive_failures <= 0:
+        return False
+    window = min(
+        HF_FAILURE_BACKOFF_MAX_S,
+        HF_FAILURE_BACKOFF_MIN_S * (2 ** (_hf_consecutive_failures - 1)),
+    )
+    return (now - _hf_failed_at) < window
 
 
 def _load_raw(force_refresh: bool = False) -> dict:
-    """Resolve the raw catalog dict: cache → HF → fallback."""
-    global _loaded_raw
+    """Resolve the raw catalog dict: cache → HF (if not backing off) → fallback.
+
+    H-M1: never stamps _fetched_at on HF failure. If HF returns nothing
+    for both datasets we keep the prior disk cache's timestamp (so next
+    call retries promptly once the backoff window passes) and we DON'T
+    rewrite the cache file with a falsified fresh timestamp.
+    """
+    global _loaded_raw, _hf_failed_at, _hf_consecutive_failures
     with _lock:
         if _loaded_raw is not None and not force_refresh:
             return _loaded_raw
@@ -247,10 +289,51 @@ def _load_raw(force_refresh: bool = False) -> dict:
         if cache is not None and _fresh(cache, now) and not force_refresh:
             _loaded_raw = cache
             return cache
-        fetched = _fetch_from_hf(fallback)
-        _write_json(CACHE_PATH, fetched)
+
+        # If we're inside the backoff window after a recent HF failure,
+        # serve from the stale cache (preferred — keeps any prior HF
+        # data) or the bundled fallback (last resort). Don't touch HF.
+        if _hf_backoff_active(now) and not force_refresh:
+            log.info("motion_catalog: HF backoff active "
+                     "(consecutive_failures=%d, age=%.0fs); using stale cache/fallback",
+                     _hf_consecutive_failures, now - _hf_failed_at)
+            if cache is not None:
+                _loaded_raw = cache
+                return cache
+            raw = dict(fallback)
+            raw["_source"] = "fallback_only_backoff"
+            _loaded_raw = raw
+            return raw
+
+        fetched, hf_ok = _fetch_from_hf(fallback)
+        if hf_ok:
+            # Real fresh data — write through to disk, reset failure counter.
+            _write_json(CACHE_PATH, fetched)
+            _hf_failed_at = 0.0
+            _hf_consecutive_failures = 0
+        else:
+            # HF failure: record backoff, do NOT stamp the cache as fresh.
+            # If a prior cache exists on disk, prefer its timestamp so we
+            # don't accidentally re-fetch every call — the backoff guard
+            # above already prevents hammering HF, and the in-memory copy
+            # below carries us until the next force_refresh or process
+            # restart. Crucially we leave CACHE_PATH untouched on failure.
+            _hf_failed_at = now
+            _hf_consecutive_failures += 1
+            log.warning("motion_catalog: HF fetch failed for both datasets "
+                        "(consecutive_failures=%d); using fallback, NOT stamping cache",
+                        _hf_consecutive_failures)
         _loaded_raw = fetched
         return fetched
+
+
+def reset_hf_backoff_for_tests() -> None:
+    """Drop in-process HF failure state so tests can exercise both
+    backoff-active and post-backoff paths deterministically."""
+    global _hf_failed_at, _hf_consecutive_failures
+    with _lock:
+        _hf_failed_at = 0.0
+        _hf_consecutive_failures = 0
 
 
 def load_catalog(force_refresh: bool = False) -> dict[str, MotionSpec]:
@@ -260,10 +343,13 @@ def load_catalog(force_refresh: bool = False) -> dict[str, MotionSpec]:
 
 
 def reset_for_tests() -> None:
-    """Drop in-process cache so tests can re-load with fresh mocks."""
-    global _loaded_raw
+    """Drop in-process cache + HF backoff state so tests can re-load
+    with fresh mocks."""
+    global _loaded_raw, _hf_failed_at, _hf_consecutive_failures
     with _lock:
         _loaded_raw = None
+        _hf_failed_at = 0.0
+        _hf_consecutive_failures = 0
 
 
 # Module-level export — robot_brain.py / robot_tools.py import this directly.

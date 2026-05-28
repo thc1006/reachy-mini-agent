@@ -147,6 +147,100 @@ def test_stale_cache_triggers_hf_refresh(fresh_catalog_env):
     assert cached["_fetched_at"] > stale_ts + 86400
 
 
+# ── H-M1: HF failure must NOT poison the 24h cache ─────────────────────────
+
+
+def test_hf_failure_does_not_stamp_cache_fresh(fresh_catalog_env):
+    """When both HF datasets return [], we must NOT write
+    _fetched_at = now to disk — otherwise the next 24h of calls would
+    short-circuit to fallback even after HF recovers. The cache file
+    should remain absent (no prior cache existed)."""
+    mc, cache, _ = fresh_catalog_env
+    # The module's import-time load_catalog() may have written cache (if
+    # the test host has network and real HF is reachable). Wipe it so
+    # this test exercises the no-prior-cache branch deterministically.
+    if cache.exists():
+        cache.unlink()
+    mc.reset_for_tests()
+    with mock.patch.object(mc, "_hf_list_clips", return_value=[]) as m:
+        catalog = mc.load_catalog(force_refresh=True)
+        assert m.call_count == 2  # both datasets attempted
+    # Fallback was used (cheerful1 from bundled fallback).
+    assert "cheerful1" in catalog
+    # Cache file must NOT have been written with a fresh timestamp on failure.
+    assert not cache.exists(), \
+        "HF failure must not write a poisoned fresh cache to disk"
+
+
+def test_hf_failure_then_success_writes_cache(fresh_catalog_env):
+    """First call: HF down → no cache stamped. Second call (after backoff
+    reset): HF recovers → cache properly written with fresh timestamp."""
+    mc, cache, _ = fresh_catalog_env
+    if cache.exists():
+        cache.unlink()
+    mc.reset_for_tests()
+
+    with mock.patch.object(mc, "_hf_list_clips", return_value=[]):
+        mc.load_catalog(force_refresh=True)
+    assert not cache.exists()
+
+    # Reset module + backoff so the next call actually hits HF.
+    mc.reset_for_tests()
+
+    def fake_list(dataset, timeout=mc.HF_API_TIMEOUT_S):
+        if "emotions" in dataset:
+            return ["cheerful1", "extra1"]
+        return ["yeah_nod"]
+    with mock.patch.object(mc, "_hf_list_clips", side_effect=fake_list):
+        catalog = mc.load_catalog(force_refresh=True)
+
+    assert "extra1" in catalog
+    assert cache.exists()
+    cached = json.loads(cache.read_text(encoding="utf-8"))
+    assert "_fetched_at" in cached
+    assert "extra1" in cached["emotions"]
+
+
+def test_hf_backoff_prevents_hammering(fresh_catalog_env, monkeypatch):
+    """After an HF failure, the next call within the backoff window
+    (>=60 s by default) must NOT re-hit HF — it serves stale cache or
+    fallback. Once the window passes (or force_refresh), HF is retried."""
+    mc, cache, _ = fresh_catalog_env
+    # Clear any eager-import cache so the disk-cache short-circuit
+    # doesn't mask the backoff path under test.
+    if cache.exists():
+        cache.unlink()
+    # Shorten min-backoff so the test stays fast; we'll patch time.time
+    # to simulate the wait.
+    monkeypatch.setattr(mc, "HF_FAILURE_BACKOFF_MIN_S", 30.0)
+    mc.reset_for_tests()
+
+    call_count = {"n": 0}
+    def failing_hf(dataset, timeout=mc.HF_API_TIMEOUT_S):
+        call_count["n"] += 1
+        return []
+    monkeypatch.setattr(mc, "_hf_list_clips", failing_hf)
+
+    # First call → HF tried for both datasets → both fail → backoff set.
+    mc.load_catalog(force_refresh=True)
+    assert call_count["n"] == 2
+
+    # Reset only the in-process catalog cache (but NOT the backoff state),
+    # then load again immediately. Backoff should suppress HF entirely.
+    with mc._lock:
+        mc._loaded_raw = None
+    mc.load_catalog()  # not force_refresh — must honour backoff
+    assert call_count["n"] == 2, "second call within backoff window must not hit HF"
+
+    # Advance the in-module failure timestamp into the past so the backoff
+    # window has elapsed, then verify HF IS retried.
+    with mc._lock:
+        mc._hf_failed_at = time.time() - 999.0
+        mc._loaded_raw = None
+    mc.load_catalog()
+    assert call_count["n"] == 4, "after backoff window expires HF must be retried"
+
+
 def test_motion_spec_play_path_urlencodes_dataset(fresh_catalog_env):
     """MotionSpec.play_path encodes slashes in dataset name (daemon expects that)."""
     mc, _, _ = fresh_catalog_env
