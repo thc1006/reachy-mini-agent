@@ -634,9 +634,17 @@ WHISPER_VAD      = True        # 內建 Silero VAD，自動略過無聲段 → �
 # (b) WHISPER_URL is set — the brain-on-Pi (Plan B, 2026-05-29) topology has
 # all STT remote on vllm0528:9000, so the heavy CUDA Whisper init is wasted.
 # When faster_whisper IS installed, keep the original GPU→CPU fallback path.
-_remote_whisper_only = (not _HAS_FASTER_WHISPER) and bool(os.getenv("WHISPER_URL", "").strip())
+_whisper_url = os.getenv("WHISPER_URL", "").strip()
+_prefer_local_str = os.getenv("PREFER_LOCAL_WHISPER", "0").strip().lower()
+_prefer_local = _prefer_local_str not in ("", "0", "false", "no", "off")
+# Remote-only when WHISPER_URL is set, UNLESS the operator explicitly opts in
+# to keeping a local Whisper warm with PREFER_LOCAL_WHISPER=1. When the
+# faster_whisper module isn't even installed (brain-on-Pi typical), the
+# preference is moot — we must go remote-only regardless.
+_remote_whisper_only = bool(_whisper_url) and (not _HAS_FASTER_WHISPER or not _prefer_local)
 if _remote_whisper_only:
-    print(f"略過本地 Whisper 載入（faster_whisper 未安裝、使用遠端 WHISPER_URL={os.environ['WHISPER_URL']}）")
+    _why = "faster_whisper 未安裝" if not _HAS_FASTER_WHISPER else "PREFER_LOCAL_WHISPER 未啟用"
+    print(f"略過本地 Whisper 載入（{_why}、使用遠端 WHISPER_URL={_whisper_url}）")
     whisper_model = None
     _WHISPER_BACKEND = "remote-only"
 else:
@@ -1298,6 +1306,11 @@ def transcribe(audio: np.ndarray) -> str:
     with _whisper_lock:
         text = _transcribe_via_5090(audio)
         if text is None:
+            # Local fallback only when faster_whisper was loaded. In remote-only
+            # mode (brain-on-Pi, _WHISPER_BACKEND == "remote-only"), the local
+            # path is None and would AttributeError — treat remote miss as silence.
+            if whisper_model is None:
+                return ""
             text = _transcribe_local(audio)
         # Normalize Whisper's zh-CN-leaning output back to zh-TW for display +
         # downstream logging consistency. Idempotent for already-traditional text.
@@ -2330,10 +2343,26 @@ def tracking_loop(mini, stop_event: threading.Event):
     # 偵測用 0.5x 降解析度：1280x720 → 640x360，CPU 時間約 1/4，精度差異忽略
     DETECT_SCALE = 0.5
     DETECT_W, DETECT_H = int(1280 * DETECT_SCALE), int(720 * DETECT_SCALE)
-    yunet = cv2.FaceDetectorYN.create(
-        "face_detection_yunet.onnx", "", (DETECT_W, DETECT_H),
-        score_threshold=0.6, nms_threshold=0.3, top_k=5,
+    # YuNet ONNX: tracked at repo root (force-added past *.onnx gitignore so
+    # git clone on Pi gets it). Resolve relative to this file so brain works
+    # from any CWD (run_brain.sh, systemd, dev shell).
+    _yunet_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "face_detection_yunet.onnx"
     )
+    if not os.path.exists(_yunet_path):
+        _yunet_path = "face_detection_yunet.onnx"  # legacy CWD-relative fallback
+    if not os.path.exists(_yunet_path):
+        print(f"  [tracking_loop] YuNet ONNX not found at {_yunet_path}; face tracking DISABLED.")
+        print("  → MediaPipe vision_loop is unaffected; auto-greet won't trigger on face presence.")
+        return
+    try:
+        yunet = cv2.FaceDetectorYN.create(
+            _yunet_path, "", (DETECT_W, DETECT_H),
+            score_threshold=0.6, nms_threshold=0.3, top_k=5,
+        )
+    except cv2.error as e:
+        print(f"  [tracking_loop] YuNet create failed ({e}); face tracking DISABLED.")
+        return
     # 平滑用指數移動平均（追蹤臉偏移）
     smooth_dx, smooth_dy   = 0.0, 0.0
     SMOOTH_ALPHA           = 0.35   # 放寬平滑 0.75→0.35，減少抖動
