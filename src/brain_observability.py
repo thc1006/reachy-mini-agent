@@ -269,6 +269,17 @@ backend_circuit_open: object = _NoOpMetric()
 llm_fallback_total: object = _NoOpMetric()
 stt_fallback_total: object = _NoOpMetric()
 tts_fallback_total: object = _NoOpMetric()
+# Wave4-P4: ElderFallGuard MediaPipe Pose fall detector. `fall_events_total`
+# counts state-machine transitions and confirmed falls; `fall_state` is a
+# numeric gauge (0=NORMAL, 1=SUSPECT, 2=FALL_CONFIRMED) for live dashboarding.
+fall_events_total: object = _NoOpMetric()
+fall_state: object = _NoOpMetric()
+# Wave4-P3 (#73): MotionQueue layered motion + barge-in interrupt. Counts every
+# enqueue/start/complete/abort outcome so we can verify barge-in latency
+# percentiles and see how often dialog actually interrupts in-flight motion.
+motion_actions_total: object = _NoOpMetric()
+motion_queue_depth: object = _NoOpMetric()
+motion_run_seconds: object = _NoOpMetric()
 
 _metrics_initialized = False
 _metrics_init_lock = threading.Lock()
@@ -279,6 +290,8 @@ def init_metrics() -> bool:
     global state_transitions, stt_latency, llm_latency, tts_latency
     global emergency_phrase, dialog_outcome, pipeline_e2e, backend_circuit_open
     global llm_fallback_total, stt_fallback_total, tts_fallback_total
+    global fall_events_total, fall_state
+    global motion_actions_total, motion_queue_depth, motion_run_seconds
     global _metrics_initialized
     if not _HAS_PROMETHEUS:
         return False
@@ -342,6 +355,29 @@ def init_metrics() -> bool:
                 "brain_tts_fallback_total",
                 "TTS call skipped / errored without playing",
                 ["reason"],
+            )
+            fall_events_total = Counter(
+                "brain_fall_events_total",
+                "ElderFallGuard fall-detection state-machine events",
+                ["state"],  # normal | suspect | confirmed | recovered | error
+            )
+            fall_state = Gauge(
+                "brain_fall_state",
+                "ElderFallGuard current state (0=NORMAL,1=SUSPECT,2=FALL_CONFIRMED)",
+            )
+            motion_actions_total = Counter(
+                "brain_motion_actions_total",
+                "MotionQueue action outcomes",
+                ["action", "outcome"],   # outcome: enqueued | started | completed | aborted | dropped | error
+            )
+            motion_queue_depth = Gauge(
+                "brain_motion_queue_depth",
+                "Pending items in MotionQueue (post-priority filtering)",
+            )
+            motion_run_seconds = Histogram(
+                "brain_motion_run_seconds",
+                "Wall time from MotionQueue start→completed/aborted per action",
+                buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
             )
             _metrics_initialized = True
             return True

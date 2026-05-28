@@ -3024,6 +3024,38 @@ def main():
         hands.start()
         vision.start()
 
+        # Wave4-P4 (#74) ElderFallGuard: MediaPipe Pose fall detector. NO new
+        # camera open — reads the same _latest_frame that tracking_loop already
+        # publishes (Wave3-P2 single-owner camera invariant preserved). Off by
+        # default; set ELDER_FALLGUARD_ENABLED=1 to opt in. Production must NOT
+        # enable without explicit human review of FP rate (#77 soak gate).
+        try:
+            import elder_fallguard as _fg
+            def _fg_frame_getter():
+                # Stale-frame guard mirrors hand_worker: refuse frames > 1 s old.
+                if _latest_frame is None or (time.time() - _latest_frame_t) > 1.0:
+                    return None
+                return _latest_frame
+            fallguard = threading.Thread(
+                target=_fg.run_loop,
+                kwargs=dict(
+                    frame_getter=_fg_frame_getter,
+                    stop_event=stop_event,
+                    logger=logger,
+                    pulse_fn=obs.pulse,
+                    metric_events=obs.fall_events_total,
+                    metric_state=obs.fall_state,
+                ),
+                daemon=True,
+                name="fallguard",
+            )
+            fallguard.start()
+        except Exception as _e:
+            try:
+                logger.error("fallguard_thread_start_fail", err=str(_e))
+            except Exception:
+                pass
+
         speak(mini, "上線了。")
         print("\n── 等待有人靠近（Ctrl+C 結束）──")
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
