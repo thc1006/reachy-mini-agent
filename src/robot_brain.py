@@ -3123,6 +3123,38 @@ def main():
         # stuck and stops notifying systemd (so WatchdogSec restarts us).
         obs.arm_watchdog()
 
+        # Wave4-P11 #85 Option (c): pin libgupnp-igd-1.6's GMainLoop worker
+        # thread (comm `gupnp-igd-threa`, kernel-truncated to 15 chars) to
+        # SCHED_IDLE on one allowed core. On Tailscale userspace there is
+        # no IGD to answer so the thread busy-spins to 33-43% CPU within
+        # ~5 min; SCHED_IDLE drops its effective contention to ~0 without
+        # any SDK / WebRTC behaviour change. Re-applied every 30 s to
+        # recapture the new TID after a WebRTC reconnect.
+        try:
+            from brain_helpers import cap_gupnp_thread as _gupnp_cap
+            if _gupnp_cap.CAP_ENABLED:
+                obs.pulse("gupnp_cap")  # seed before spawn so watchdog sees it
+                threading.Thread(
+                    target=_gupnp_cap.cap_loop,
+                    kwargs=dict(
+                        stop_event=stop_event,
+                        interval_s=_gupnp_cap.CAP_INTERVAL_S,
+                        pulse_fn=lambda: obs.pulse("gupnp_cap"),
+                        logger=logger,
+                        core=_gupnp_cap.CAP_CORE,
+                    ),
+                    daemon=True,
+                    name="gupnp-cap",
+                ).start()
+            else:
+                logger.info("gupnp_cap_disabled",
+                            reason="BRAIN_GUPNP_CAP_ENABLED=0")
+        except Exception as _e:
+            try:
+                logger.error("gupnp_cap_thread_start_fail", err=str(_e))
+            except Exception:
+                pass
+
         try:
             while True:
                 time.sleep(0.5)
@@ -3131,6 +3163,14 @@ def main():
             print("\n關閉中...")
         finally:
             stop_event.set()
+            # Wave4-P11 #85: clear the gupnp-cap heartbeat so the watchdog
+            # doesn't mark this sidecar stale during a graceful shutdown
+            # (the daemon thread exits via stop_event but the clear is
+            # cheap insurance against a slow shutdown race).
+            try:
+                obs.clear_pulse("gupnp_cap")
+            except Exception:
+                pass
             # M-O1: cancel the recurring faulthandler dump so a graceful
             # shutdown doesn't leak a SIGALRM-driven traceback after exit.
             try:
