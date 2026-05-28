@@ -40,13 +40,32 @@ logging.getLogger("mem0").setLevel(logging.ERROR)
 _ZW_RE = re.compile(r"[\u200b-\u200f\u2028-\u202f\ufe00-\ufe0f]")
 
 
-DEFAULT_QDRANT_PATH = str(Path.home() / "dev/reachy-agent/robot/.qdrant_memory")
-DEFAULT_SUMMARY_PATH = str(Path.home() / "dev/reachy-agent/robot/conversation_summary.txt")
+DEFAULT_QDRANT_PATH = os.getenv(
+    "MEM0_QDRANT_PATH",
+    str(Path.home() / "dev/reachy-agent/robot/.qdrant_memory"),
+)
+DEFAULT_SUMMARY_PATH = os.getenv(
+    "MEM0_SUMMARY_PATH",
+    str(Path.home() / "dev/reachy-agent/robot/conversation_summary.txt"),
+)
 DEFAULT_CONV_LOG_PATH = str(Path.home() / "dev/reachy-agent/robot/conversation_log.jsonl")
 DEFAULT_USER_ID     = os.getenv("MEM0_USER_ID", "default")
 DEFAULT_LLM_MODEL   = os.getenv("MEM0_LLM_MODEL", "qwen3.6:35b-a3b")
 DEFAULT_EMBED_MODEL = os.getenv("MEM0_EMBED_MODEL", "bge-m3")
 DEFAULT_OLLAMA_URL  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+# Provider selection -- Pi venv may not have Ollama; allow OpenAI-compatible
+# vLLM endpoint (MEM0_LLM_PROVIDER=openai) and CPU-only FastEmbed
+# (MEM0_EMBED_PROVIDER=fastembed) so Mem0 stays usable without Ollama.
+DEFAULT_LLM_PROVIDER   = os.getenv("MEM0_LLM_PROVIDER", "ollama").lower()
+DEFAULT_EMBED_PROVIDER = os.getenv("MEM0_EMBED_PROVIDER", "ollama").lower()
+DEFAULT_LLM_BASE_URL   = os.getenv("MEM0_LLM_BASE_URL", "http://vllm0528:8000/v1")
+DEFAULT_LLM_API_KEY    = os.getenv("MEM0_LLM_API_KEY", "dummy")
+# bge-m3 (ollama) = 1024; BAAI/bge-small-zh-v1.5 (fastembed) = 512
+DEFAULT_EMBED_DIMS     = int(os.getenv("MEM0_EMBED_DIMS", "1024"))
+# Namespace tag attached to every add() -- partitions facts by domain
+# (elder_facts: medications, contacts, allergies, preferences).
+DEFAULT_NAMESPACE      = os.getenv("MEM0_NAMESPACE", "elder_facts")
 
 
 class RobotMemory:
@@ -68,6 +87,13 @@ class RobotMemory:
         summary_keep_recent: int = 20,  # do NOT summarize the last K turns
         write_own_log: bool = False,    # if True, add_turn also appends to jsonl
                                         # (tests use this; robot_brain has its own _log_turn)
+        # Provider selection (env-driven by default)
+        llm_provider: str = DEFAULT_LLM_PROVIDER,        # "ollama" | "openai"
+        embed_provider: str = DEFAULT_EMBED_PROVIDER,    # "ollama" | "fastembed"
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,        # used when llm_provider == "openai"
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
+        embed_dims: int = DEFAULT_EMBED_DIMS,
+        namespace: str = DEFAULT_NAMESPACE,              # metadata tag for every add()
     ) -> None:
         self.user_id = user_id
         self.enabled = False
@@ -86,6 +112,13 @@ class RobotMemory:
         self._summary_lock = threading.Lock()
         self._pending_summary_futures: list = []  # track for flush_summary timeout
         self._write_own_log = bool(write_own_log)
+        # Provider / namespace knobs -- captured so _regenerate_summary and
+        # _add_safe can pick the right transport.
+        self.llm_provider = (llm_provider or "ollama").lower()
+        self.embed_provider = (embed_provider or "ollama").lower()
+        self.llm_base_url = llm_base_url
+        self.llm_api_key = llm_api_key
+        self.namespace = namespace
 
         if os.getenv("ROBOT_MEMORY", "1") != "1":
             return   # explicitly disabled
@@ -97,28 +130,50 @@ class RobotMemory:
             return
 
         Path(qdrant_path).mkdir(parents=True, exist_ok=True)
-        config = {
-            "llm": {
+
+        if self.llm_provider == "openai":
+            llm_cfg = {
+                "provider": "openai",
+                "config": {
+                    "model": llm_model,
+                    "openai_base_url": llm_base_url,
+                    "api_key": llm_api_key,
+                    "temperature": 0.1,
+                },
+            }
+        else:
+            llm_cfg = {
                 "provider": "ollama",
                 "config": {
                     "model": llm_model,
                     "ollama_base_url": ollama_base_url,
                     "temperature": 0.1,
                 },
-            },
-            "embedder": {
+            }
+
+        if self.embed_provider == "fastembed":
+            embed_cfg = {
+                "provider": "fastembed",
+                "config": {"model": embed_model},
+            }
+        else:
+            embed_cfg = {
                 "provider": "ollama",
                 "config": {
                     "model": embed_model,
                     "ollama_base_url": ollama_base_url,
                 },
-            },
+            }
+
+        config = {
+            "llm": llm_cfg,
+            "embedder": embed_cfg,
             "vector_store": {
                 "provider": "qdrant",
                 "config": {
                     "path": qdrant_path,
                     "collection_name": collection,
-                    "embedding_model_dims": 1024,  # bge-m3
+                    "embedding_model_dims": int(embed_dims),
                 },
             },
         }
@@ -132,7 +187,11 @@ class RobotMemory:
                 max_workers=1, thread_name_prefix="mem0-summary"
             )
             self.enabled = True
-            print(f"  [robot_memory] enabled — qdrant={qdrant_path} user={user_id}")
+            print(
+                f"  [robot_memory] enabled -- qdrant={qdrant_path} user={user_id} "
+                f"llm={self.llm_provider}:{llm_model} embed={self.embed_provider}:{embed_model} "
+                f"ns={self.namespace}"
+            )
         except Exception as e:
             # Ollama down, bad config, bge-m3 not pulled, etc.
             print(f"  [robot_memory] init failed, running disabled: {e}")
@@ -182,7 +241,14 @@ class RobotMemory:
     def _add_safe(self, text: str) -> None:
         try:
             with self._lock:
-                self._memory.add(text, user_id=self.user_id)
+                # Tag every fact with namespace metadata so callers can later
+                # filter (e.g. only "elder_facts" medications/contacts/allergies/
+                # preferences) without scanning unrelated entries.
+                self._memory.add(
+                    text,
+                    user_id=self.user_id,
+                    metadata={"namespace": self.namespace},
+                )
         except urllib.error.HTTPError as e:
             body = ""
             try: body = e.read().decode("utf-8", "replace")
@@ -341,23 +407,50 @@ class RobotMemory:
                 f"{instruction}\n\n"
                 f"<<<DIALOG>>>\n{dlg_safe}\n<<<END>>>\n\nSUMMARY:"
             )
-        payload = {
-            "model": self.llm_model,
-            "stream": False,
-            "think": False,
-            "keep_alive": "30m",
-            "options": {"temperature": 0.4, "num_predict": 500, "num_ctx": 16384},
-            "messages": [{"role": "user", "content": prompt}],
-        }
+        # Provider-aware summary LLM call. OpenAI path used when Mem0 itself
+        # is wired to a vLLM endpoint (no Ollama installed on the Pi).
         try:
-            req = urllib.request.Request(
-                f"{self.ollama_base_url}/api/chat",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            summary = (data.get("message", {}).get("content") or "").strip()
+            if self.llm_provider == "openai":
+                payload = {
+                    "model": self.llm_model,
+                    "temperature": 0.4,
+                    "max_tokens": 500,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                req = urllib.request.Request(
+                    f"{self.llm_base_url.rstrip('/')}/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.llm_api_key}",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                summary = (
+                    (data.get("choices") or [{}])[0]
+                    .get("message", {})
+                    .get("content")
+                    or ""
+                ).strip()
+            else:
+                payload = {
+                    "model": self.llm_model,
+                    "stream": False,
+                    "think": False,
+                    "keep_alive": "30m",
+                    "options": {"temperature": 0.4, "num_predict": 500, "num_ctx": 16384},
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                req = urllib.request.Request(
+                    f"{self.ollama_base_url}/api/chat",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                summary = (data.get("message", {}).get("content") or "").strip()
             if not summary:
                 return
             # Write atomically
