@@ -1380,7 +1380,28 @@ OLLAMA_THINK     = os.getenv("OLLAMA_THINK", "0") == "1"
 # local vLLM /v1/chat/completions endpoint (continuous batching + concurrent
 # vision/dialog). Default ollama keeps current behaviour.
 LLM_BACKEND      = os.getenv("LLM_BACKEND", "ollama").lower()
-VLLM_HOST        = os.getenv("VLLM_HOST", "http://localhost:8000")
+
+def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: str) -> str:
+    """Resolve a vLLM base URL from env vars (bare host + port, or full URL).
+
+    If ``$host_env`` starts with ``http://`` / ``https://`` it is returned as-is
+    (legacy form for backward compat). Otherwise we combine the bare host with
+    ``$port_env`` into ``http://{host}:{port}`` — preferred new convention so a
+    single VLLM_PORT toggle covers primary + backup.
+    """
+    host = (os.getenv(host_env) or default_host).strip()
+    if host.startswith("http://") or host.startswith("https://"):
+        return host
+    port = (os.getenv(port_env) or default_port).strip()
+    return f"http://{host}:{port}"
+
+
+# TODO(blue/green): single-boot auto-failover not wired — VLLM_HOST_BACKUP is
+# currently exposed for manual failover only (no inline retry/circuit-breaker).
+VLLM_HOST_RAW    = os.getenv("VLLM_HOST", "http://localhost:8000")  # legacy display only
+VLLM_PORT        = os.getenv("VLLM_PORT", "8000")
+VLLM_HOST        = _vllm_base("VLLM_HOST", "VLLM_PORT", "vllm0528", "8000")
+VLLM_HOST_BACKUP = _vllm_base("VLLM_HOST_BACKUP", "VLLM_PORT_BACKUP", "s1", "8000")
 VLLM_MODEL       = os.getenv("VLLM_MODEL", "qwen36-awq")
 CLAUDE_MODEL     = "claude-haiku-4-5-20251001"
 

@@ -30,7 +30,23 @@ LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").lower()
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.6:35b-a3b")
 
-VLLM_HOST = os.getenv("VLLM_HOST", "http://localhost:8000")
+def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: str) -> str:
+    """Resolve a vLLM base URL from env vars.
+
+    Accepts either a bare host (preferred new convention; combined with port_env
+    into ``http://{host}:{port}``) or a full ``http(s)://`` URL (legacy form,
+    returned as-is). Empty host falls back to ``default_host``.
+    """
+    host = (os.getenv(host_env) or default_host).strip()
+    if host.startswith("http://") or host.startswith("https://"):
+        return host
+    port = (os.getenv(port_env) or default_port).strip()
+    return f"http://{host}:{port}"
+
+
+# TODO(blue/green): single-boot auto-failover not wired — VLLM_HOST_BACKUP is
+# currently exposed for manual failover only.
+VLLM_HOST = _vllm_base("VLLM_HOST", "VLLM_PORT", "vllm0528", "8000")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "qwen36-awq")
 
 
