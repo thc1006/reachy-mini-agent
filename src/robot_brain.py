@@ -20,6 +20,10 @@ import sys
 import threading
 import time
 
+# Elder-care features (P6/P7/P8) — all NO-OP unless ELDER_CARE_MODE=1.
+# Self-contained module: pure helpers + thin SDK glue. See src/elder_care.py.
+import elder_care
+
 # CUDA 穩定性：lazy load 減記憶體碎片、CUDA 0 固定
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -823,7 +827,12 @@ async def _fetch_edge_tts(text: str):
          hiragana/katakana→ja-JP, hangul→ko-KR, else en-US).
     """
     voice = os.getenv("TTS_VOICE", "").strip() or pick_voice(text)
-    cache_path = _edge_cache_path(text, voice)
+    # When P7 elder-mode rate is active, key the cache by voice+rate so the
+    # slowed audio doesn't get served from a stale full-speed cache entry
+    # (and vice-versa on toggle).
+    _rate_for_key = elder_care.edge_tts_rate()
+    _cache_voice = f"{voice}@rate{_rate_for_key}" if _rate_for_key else voice
+    cache_path = _edge_cache_path(text, _cache_voice)
     if cache_path.exists():
         try:
             data, sr = sf.read(str(cache_path), dtype="float32")
@@ -840,7 +849,15 @@ async def _fetch_edge_tts(text: str):
     try:
         t0 = time.perf_counter()
         buf = io.BytesIO()
-        async for chunk in Communicate(text, voice=voice).stream():
+        # P7 — Edge TTS rate slowdown for elderly listeners (PMC10917141).
+        # `rate` must be a signed-percent string like "-10%" / "+0%". When
+        # elder mode is off, edge_tts_rate() returns "" and we pass Edge's
+        # default (omit the kwarg) to preserve current production behaviour.
+        _rate = elder_care.edge_tts_rate()
+        _comm_kwargs = {"voice": voice}
+        if _rate:
+            _comm_kwargs["rate"] = _rate
+        async for chunk in Communicate(text, **_comm_kwargs).stream():
             if chunk["type"] == "audio":
                 buf.write(chunk["data"])
         if buf.tell() == 0:
@@ -1074,7 +1091,10 @@ async def _stream_tts(text: str, mini) -> None:
         except Exception:
             pass
         # Hold mic-gate a bit longer so speaker tail + USB buffer doesn't echo.
-        time.sleep(TTS_TAIL_DRAIN_S)
+        # P7 — Elder mode adds ELDER_PAUSE_MS (default 400ms) of additional
+        # inter-turn silence (PMC10917141: gives elderly listeners measurable
+        # extra time before the robot resumes listening / next turn starts).
+        time.sleep(TTS_TAIL_DRAIN_S + elder_care.extra_post_tts_pause_s())
         _speaking_event.clear()
 
 def speak(mini, text: str):
@@ -1138,6 +1158,11 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
         chunks.append(mono)
         energy = float(np.sqrt(np.mean(mono ** 2)))
         if energy > SILENCE_THRESHOLD:
+            # P8 — fire antenna "listening" cue on the rising VAD edge only
+            # (first transition silent → speech this utterance). Cheap to call
+            # but firing every frame would queue redundant motor commands.
+            if not has_speech:
+                elder_care.fire_antenna_cue(mini, "listening")
             has_speech = True
             silent_s = 0.0
             print("▪", end="", flush=True)
@@ -1146,6 +1171,9 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
         if has_speech and silent_s >= SILENCE_DURATION:
             break
     print()
+    # P8 — return antennas to neutral once we stop listening, regardless of
+    # whether speech was captured (cue must not leave the antennas tilted).
+    elder_care.fire_antenna_cue(mini, "neutral")
     return np.concatenate(chunks) if has_speech else None
 
 def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
@@ -2295,6 +2323,17 @@ def do_conversation(mini):
         text = transcribe(audio)
         if not text:
             continue
+        # P6 — Elder-care emergency pre-LLM route. When ELDER_CARE_MODE=1 and
+        # the transcript matches any distress / fall / medical / call-family
+        # phrase, skip the LLM entirely: log, speak immediate acknowledgment,
+        # POST optional webhook. Target sub-500 ms ack vs ~2 s LLM round-trip.
+        if elder_care.elder_mode_enabled():
+            _emerg = elder_care.is_emergency(text)
+            if _emerg:
+                elder_care.handle_emergency(text, _emerg, speak_fn=speak, mini=mini)
+                _log_turn(text, elder_care.emergency_ack_text(text))
+                turns += 1
+                continue
         if not _is_meaningful_utterance(text):
             noise_skips += 1
             print(f"  [噪音過濾 {noise_skips}/{MAX_NOISE_SKIPS}] '{text}' → 略過")
