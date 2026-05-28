@@ -44,9 +44,11 @@ References
 from __future__ import annotations
 
 import gc
+import json
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 # ── env helpers (mirror elder_care._truthy so behaviour is consistent) ──────
@@ -110,6 +112,32 @@ def _recreate_s() -> float:
     except ValueError:
         v = 300.0
     return v
+
+
+def _grace_upright_s() -> float:
+    """How long ago the subject must have been seen upright for a 'prone'
+    pose (without an observed rapid-descent) to still count as a likely
+    fall. Outside this window we treat prone-only as ambient (e.g. user
+    sleeping on sofa, child on floor, tilted camera) and STAY in NORMAL.
+
+    Default 60 s — long enough to catch falls where the descent sample
+    was missed (low-light frame, hand_worker priority), short enough to
+    exclude an already-lying subject the brain just started observing.
+    """
+    try:
+        v = float(os.getenv("ELDER_FALLGUARD_GRACE_UPRIGHT_S", "60.0"))
+    except ValueError:
+        v = 60.0
+    return max(5.0, v)
+
+
+def _webhook_dlq_path() -> Path:
+    """Local dead-letter queue for fall webhooks. One JSON line per failed
+    delivery; future reconciler can replay. Default under $HOME/brain so
+    it follows the systemd --user unit's WorkingDirectory."""
+    p = os.getenv("ELDER_FALLGUARD_WEBHOOK_DLQ",
+                  str(Path.home() / "brain" / ".webhook_dlq.jsonl"))
+    return Path(p)
 
 
 # ── State machine ──────────────────────────────────────────────────────────
@@ -213,7 +241,8 @@ class FallGuard:
                  metric_events: Any = None, metric_state: Any = None,
                  prone_s: Optional[float] = None,
                  grace_s: Optional[float] = None,
-                 cooldown_s: Optional[float] = None):
+                 cooldown_s: Optional[float] = None,
+                 grace_upright_s: Optional[float] = None):
         self.state = NORMAL
         self.logger = logger
         # Caller supplies the alert callback (defaults to fire_fall_alert
@@ -225,10 +254,18 @@ class FallGuard:
         self.prone_s = prone_s if prone_s is not None else _prone_s()
         self.grace_s = grace_s if grace_s is not None else _grace_s()
         self.cooldown_s = cooldown_s if cooldown_s is not None else _cooldown_s()
+        # H-F1: how recently we must have seen the subject upright before
+        # accepting a prone-only entry into SUSPECT (defeats already-lying
+        # FP: sleeping on sofa, child on floor, tilted camera, short user).
+        self.grace_upright_s = (grace_upright_s if grace_upright_s is not None
+                                else _grace_upright_s())
 
         self._suspect_at: Optional[float] = None
         self._prone_since: Optional[float] = None
         self._last_alert_at: float = 0.0
+        # H-F1: last wall-time tick where we saw the subject upright
+        # (NORMAL + torso_deg < 30°). None until we've seen one.
+        self._last_upright_at: Optional[float] = None
         # Rolling-window of recent (t, hip_y) — used to detect rapid descent.
         # Keep ~2 s worth at our sample rate; default short list is fine.
         self._hip_history: list[tuple[float, float]] = []
@@ -237,6 +274,14 @@ class FallGuard:
         # Paper does not give a single number; this is conservative — small
         # height drops (sitting down) are < 0.10 in our manual probes.
         self._DESCENT_DELTA = 0.15
+
+    def _was_upright_recently_within(self, grace_s: float, now: float) -> bool:
+        """Return True iff we've seen the subject upright (NORMAL +
+        torso<30°) within the past `grace_s` seconds. False if never seen
+        upright OR if the last upright observation was longer ago."""
+        if self._last_upright_at is None:
+            return False
+        return (now - self._last_upright_at) <= grace_s
 
     def _log(self, event: str, **kv) -> None:
         if self.logger is None:
@@ -309,13 +354,32 @@ class FallGuard:
             rapid_descent = self._track_descent(hip_y_value, now)
 
         if self.state == NORMAL:
-            # Enter SUSPECT on either rapid descent OR an unambiguously
-            # prone torso (someone already lying down when detection starts).
-            if rapid_descent or prone:
+            # Track "last seen upright" while we're still in NORMAL so the
+            # prone-only entry path below has a recency anchor (H-F1).
+            if torso_deg is not None and torso_deg < 30.0:
+                self._last_upright_at = now
+            # H-F1: enter SUSPECT only when we have evidence the subject
+            # actively moved into prone — either:
+            #   (a) rapid_descent observed in the rolling window, OR
+            #   (b) prone now AND we saw the subject upright within
+            #       grace_upright_s seconds (descent sample may have been
+            #       missed, but recent upright proves the subject moved).
+            # An already-prone subject we just started observing
+            # (last_upright_at is None or older than grace) stays NORMAL —
+            # this kills the sleeping-on-sofa / child-on-floor / tilted-
+            # camera / short-user false-positive class.
+            prone_with_recent_upright = (
+                prone and self._was_upright_recently_within(
+                    self.grace_upright_s, now)
+            )
+            if rapid_descent or prone_with_recent_upright:
                 self._suspect_at = now
                 self._prone_since = now if prone else None
-                self._set_state(SUSPECT, now,
-                                reason="rapid_descent" if rapid_descent else "prone_pose")
+                if rapid_descent:
+                    reason = "rapid_descent"
+                else:
+                    reason = "prone_after_upright"
+                self._set_state(SUSPECT, now, reason=reason)
                 self._record_event("suspect")
         elif self.state == SUSPECT:
             if prone:
@@ -371,11 +435,157 @@ class FallGuard:
 # ── Default alert callback (production wiring to elder_care.py) ─────────────
 
 
+# H-F2: retry envelope params. 3 attempts, 1→4→16 s exponential backoff.
+_WEBHOOK_MAX_ATTEMPTS = 3
+_WEBHOOK_BACKOFF_BASE_S = 1.0
+_WEBHOOK_BACKOFF_FACTOR = 4.0
+
+
+def _webhook_outcome_metric():
+    """Resolve the prometheus counter lazily so tests / fallbacks without
+    brain_observability still work. Returns a no-op if unavailable."""
+    try:
+        import brain_observability as obs  # local — keep this module self-contained
+        return getattr(obs, "fall_webhook_outcome_total", None)
+    except Exception:
+        return None
+
+
+def _append_webhook_dlq(payload: dict, logger: Any = None) -> bool:
+    """Append a single JSON line to the local DLQ file. Best-effort: any I/O
+    error is logged but never raised (the alert path must not crash)."""
+    try:
+        p = _webhook_dlq_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        if logger is not None:
+            try:
+                logger.error("webhook_dlq_write_failed", err=str(e))
+            except Exception:
+                pass
+        return False
+
+
+def _deliver_webhook_with_retry(text: str, phrase: str, logger: Any = None,
+                                sleep_fn: Callable[[float], None] = time.sleep,
+                                ) -> str:
+    """Call elder_care.post_webhook with bounded exponential-backoff retry.
+    Returns one of: "success", "retry_success", "failed".
+
+    Logs `webhook_post_attempt` per try with status / latency, and
+    `webhook_post_failed_dlq` on final failure (after appending a DLQ line
+    so a future reconciler can replay)."""
+    try:
+        import elder_care
+    except Exception as e:
+        if logger is not None:
+            try:
+                logger.error("fallguard_elder_care_import_fail", err=str(e))
+            except Exception:
+                pass
+        # Treat import failure as a delivery failure too — DLQ it so we
+        # don't lose the event silently.
+        _append_webhook_dlq(
+            {"ts": time.time(), "text": text, "phrase": phrase,
+             "reason": "elder_care_import_failed", "err": str(e)},
+            logger=logger,
+        )
+        counter = _webhook_outcome_metric()
+        if counter is not None:
+            try:
+                counter.labels(result="failed").inc()
+            except Exception:
+                pass
+        return "failed"
+
+    counter = _webhook_outcome_metric()
+    last_err: Optional[str] = None
+    last_status: Optional[int] = None
+    for attempt in range(1, _WEBHOOK_MAX_ATTEMPTS + 1):
+        t0 = time.monotonic()
+        try:
+            res = elder_care.post_webhook(text, phrase)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            # elder_care.post_webhook returns truthy on HTTP 2xx; surface
+            # status_code if available (newer signature returns dict).
+            status_code: Optional[int] = None
+            ok = bool(res)
+            if isinstance(res, dict):
+                status_code = res.get("status_code")
+                ok = bool(res.get("ok", res.get("status_code", 0) in range(200, 300)))
+            last_status = status_code
+            if logger is not None:
+                try:
+                    logger.info("webhook_post_attempt",
+                                attempt=attempt,
+                                status_code=status_code,
+                                latency_ms=latency_ms,
+                                ok=ok)
+                except Exception:
+                    pass
+            if ok:
+                if counter is not None:
+                    try:
+                        label = "success" if attempt == 1 else "retry"
+                        counter.labels(result=label).inc()
+                    except Exception:
+                        pass
+                return "success" if attempt == 1 else "retry_success"
+        except Exception as e:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            last_err = str(e)
+            if logger is not None:
+                try:
+                    logger.warning("webhook_post_attempt",
+                                   attempt=attempt,
+                                   status_code=None,
+                                   latency_ms=latency_ms,
+                                   err=last_err)
+                except Exception:
+                    pass
+
+        if attempt < _WEBHOOK_MAX_ATTEMPTS:
+            wait = _WEBHOOK_BACKOFF_BASE_S * (_WEBHOOK_BACKOFF_FACTOR ** (attempt - 1))
+            try:
+                sleep_fn(wait)
+            except Exception:
+                pass
+
+    # All attempts failed → DLQ + counter + ERROR log.
+    _append_webhook_dlq(
+        {"ts": time.time(), "text": text, "phrase": phrase,
+         "attempts": _WEBHOOK_MAX_ATTEMPTS,
+         "last_status": last_status, "last_err": last_err},
+        logger=logger,
+    )
+    if counter is not None:
+        try:
+            counter.labels(result="failed").inc()
+        except Exception:
+            pass
+    if logger is not None:
+        try:
+            logger.error("webhook_post_failed_dlq",
+                         attempts=_WEBHOOK_MAX_ATTEMPTS,
+                         last_status=last_status,
+                         last_err=last_err)
+        except Exception:
+            pass
+    return "failed"
+
+
 def fire_fall_alert(now: float, torso_deg: Optional[float] = None,
                     logger: Any = None) -> dict:
     """Production alert path: log + (async) webhook via the SAME elder_care
     primitives used for the spoken-phrase emergency route. Reuses the
     existing JSON payload schema {ts, phrase, text, robot}.
+
+    Webhook delivery uses bounded exponential-backoff retry (H-F2): 3
+    attempts spaced 1→4→16 s, with per-attempt status/latency logged and
+    a local DLQ line written on final failure for future reconciler replay.
 
     Safe to call from any thread; never raises."""
     try:
@@ -402,13 +612,16 @@ def fire_fall_alert(now: float, torso_deg: Optional[float] = None,
             except Exception:
                 pass
 
-    # Webhook fire-and-forget so the FallGuard tick loop is never blocked.
+    # Webhook delivery: spawn a daemon thread that runs the retry envelope
+    # so the FallGuard tick loop is never blocked even if all attempts
+    # hit their full 16s backoff.
     url = os.getenv("ELDER_EMERGENCY_WEBHOOK_URL", "").strip()
     if url:
         try:
             threading.Thread(
-                target=elder_care.post_webhook,
+                target=_deliver_webhook_with_retry,
                 args=(text, phrase),
+                kwargs={"logger": logger},
                 daemon=True,
                 name="fallguard-webhook",
             ).start()
@@ -458,6 +671,7 @@ def run_loop(
     metric_events: Any = None,
     metric_state: Any = None,
     alert_cb: Optional[Callable] = None,
+    clear_pulse_fn: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Worker target. Loops at _hz() Hz pulling the latest frame from
     `frame_getter`, runs Pose, feeds classify_pose → FallGuard.step.
@@ -559,10 +773,31 @@ def run_loop(
                         except Exception:
                             pass
                 except Exception as e:
+                    # M3: recreate failure used to silently return — pulse
+                    # would stop and the watchdog had no way to know whether
+                    # we'd died vs. were just slow. Now we explicitly clear
+                    # our pulse so the watchdog forgets us, set ERROR state
+                    # on the metric gauge, and emit a loud log. The caller
+                    # supervisor can decide whether to restart us.
                     if logger is not None:
                         try:
-                            logger.error("fallguard_landmarker_recreate_fail",
+                            logger.error("fallguard_landmarker_recreate_failed",
                                          err=str(e))
+                        except Exception:
+                            pass
+                    if metric_state is not None:
+                        try:
+                            metric_state.set(-1)  # ERROR sentinel
+                        except Exception:
+                            pass
+                    if metric_events is not None:
+                        try:
+                            metric_events.labels(state="error").inc()
+                        except Exception:
+                            pass
+                    if clear_pulse_fn is not None:
+                        try:
+                            clear_pulse_fn(name)
                         except Exception:
                             pass
                     return

@@ -274,6 +274,9 @@ tts_fallback_total: object = _NoOpMetric()
 # numeric gauge (0=NORMAL, 1=SUSPECT, 2=FALL_CONFIRMED) for live dashboarding.
 fall_events_total: object = _NoOpMetric()
 fall_state: object = _NoOpMetric()
+# H-F2: webhook delivery outcomes for FallGuard alerts.
+# result=success (1st attempt) | retry (≥2nd attempt) | failed (DLQ written)
+fall_webhook_outcome_total: object = _NoOpMetric()
 # Wave4-P3 (#73): MotionQueue layered motion + barge-in interrupt. Counts every
 # enqueue/start/complete/abort outcome so we can verify barge-in latency
 # percentiles and see how often dialog actually interrupts in-flight motion.
@@ -290,7 +293,7 @@ def init_metrics() -> bool:
     global state_transitions, stt_latency, llm_latency, tts_latency
     global emergency_phrase, dialog_outcome, pipeline_e2e, backend_circuit_open
     global llm_fallback_total, stt_fallback_total, tts_fallback_total
-    global fall_events_total, fall_state
+    global fall_events_total, fall_state, fall_webhook_outcome_total
     global motion_actions_total, motion_queue_depth, motion_run_seconds
     global _metrics_initialized
     if not _HAS_PROMETHEUS:
@@ -364,6 +367,11 @@ def init_metrics() -> bool:
             fall_state = Gauge(
                 "brain_fall_state",
                 "ElderFallGuard current state (0=NORMAL,1=SUSPECT,2=FALL_CONFIRMED)",
+            )
+            fall_webhook_outcome_total = Counter(
+                "brain_fall_webhook_outcome_total",
+                "FallGuard webhook delivery outcome (with retry envelope)",
+                ["result"],  # success | retry | failed
             )
             motion_actions_total = Counter(
                 "brain_motion_actions_total",

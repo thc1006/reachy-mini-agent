@@ -18,6 +18,7 @@ Scenarios covered (>=6):
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -235,3 +236,219 @@ def test_fallguard_enabled_truthy(monkeypatch):
     assert fg.fallguard_enabled() is True
     monkeypatch.setenv("ELDER_FALLGUARD_ENABLED", "0")
     assert fg.fallguard_enabled() is False
+
+
+# ── 9. H-F1: already-prone from t=0 must NOT enter SUSPECT (FP class) ──────
+
+
+def test_already_prone_subject_from_t0_stays_normal():
+    """Subject is already lying down when detection starts (sleeping on
+    sofa, child on floor, tilted camera, short user). Without an observed
+    upright baseline within grace_upright_s the prone pose alone must NOT
+    trip SUSPECT — that was the H-F1 FP risk."""
+    fired = []
+    guard = fg.FallGuard(prone_s=3.0, grace_s=10.0, cooldown_s=60.0,
+                         grace_upright_s=60.0,
+                         alert_cb=lambda **kw: fired.append(kw))
+    t = 1000.0
+    # 20 ticks (~6.6s) of pure horizontal pose. No prior upright observation.
+    for _ in range(20):
+        guard.step(_features(_pose_horizontal()), now=t)
+        t += 0.33
+    assert guard.state == fg.NORMAL, "prone-only without recent upright must stay NORMAL"
+    assert fired == [], "no alert should fire from ambient lying subject"
+
+
+def test_upright_then_prone_within_grace_enters_suspect_and_confirms():
+    """H-F1 path (b): upright observed within grace_upright_s, then prone
+    without a clean descent sample. Must still enter SUSPECT and confirm
+    after prone_s. Ensures we didn't kill legitimate fall detection."""
+    fired = []
+    guard = fg.FallGuard(prone_s=3.0, grace_s=10.0, cooldown_s=60.0,
+                         grace_upright_s=60.0,
+                         alert_cb=lambda **kw: fired.append(kw))
+    t = 1000.0
+    # 3 ticks upright (torso vertical) — establishes _last_upright_at.
+    for _ in range(3):
+        guard.step(_features(_pose_upright(hip_y=0.75, sh_y=0.30)), now=t)
+        t += 0.33
+    # Skip ahead 5 s — within grace_upright_s=60s — and observe prone
+    # without an in-window descent sample.
+    t += 5.0
+    guard.step(_features(_pose_horizontal()), now=t)
+    assert guard.state == fg.SUSPECT, "prone after recent upright must enter SUSPECT"
+    # Hold prone for >3 s → FALL_CONFIRMED + alert.
+    t += 0.33
+    for _ in range(12):
+        guard.step(_features(_pose_horizontal()), now=t)
+        t += 0.33
+    assert guard.state == fg.FALL_CONFIRMED
+    assert len(fired) == 1
+
+
+def test_upright_then_prone_beyond_grace_stays_normal():
+    """If the last upright observation is older than grace_upright_s,
+    prone-only is treated as ambient (subject moved away then we re-saw
+    them lying). Stays NORMAL."""
+    guard = fg.FallGuard(prone_s=3.0, grace_s=10.0, cooldown_s=60.0,
+                         grace_upright_s=10.0)
+    t = 1000.0
+    guard.step(_features(_pose_upright(hip_y=0.75, sh_y=0.30)), now=t)
+    # Jump past grace_upright_s.
+    t += 120.0
+    guard.step(_features(_pose_horizontal()), now=t)
+    assert guard.state == fg.NORMAL
+
+
+# ── 10. H-F2: webhook retry envelope + DLQ ─────────────────────────────────
+
+
+def test_webhook_retries_then_succeeds_on_attempt_2(monkeypatch, tmp_path):
+    """First POST returns HTTP 500 → second attempt returns 200. Final
+    outcome should be retry_success; no DLQ entry written."""
+    # Isolate DLQ path so this test cannot pollute $HOME/brain.
+    dlq = tmp_path / "dlq.jsonl"
+    monkeypatch.setenv("ELDER_FALLGUARD_WEBHOOK_DLQ", str(dlq))
+
+    # Fake elder_care.post_webhook returning a status-dict (modern
+    # signature). First call HTTP 500, second call HTTP 200.
+    calls = []
+    def fake_post_webhook(text, phrase):
+        calls.append((text, phrase))
+        if len(calls) == 1:
+            return {"ok": False, "status_code": 500}
+        return {"ok": True, "status_code": 200}
+
+    import sys as _sys
+    fake_module = types.SimpleNamespace(post_webhook=fake_post_webhook)
+    monkeypatch.setitem(_sys.modules, "elder_care", fake_module)
+    # Don't actually sleep through 1+4s exponential backoff.
+    sleeps = []
+    result = fg._deliver_webhook_with_retry(
+        "hello", "fall_detected",
+        sleep_fn=lambda s: sleeps.append(s),
+    )
+
+    assert result == "retry_success"
+    assert len(calls) == 2
+    assert sleeps == [1.0]  # only the first inter-attempt wait
+    assert not dlq.exists(), "no DLQ entry expected on retry success"
+
+
+def test_webhook_all_attempts_fail_writes_dlq(monkeypatch, tmp_path):
+    """All 3 attempts return HTTP 500 → final outcome failed, DLQ line
+    written, counter increments on result=failed."""
+    dlq = tmp_path / "dlq.jsonl"
+    monkeypatch.setenv("ELDER_FALLGUARD_WEBHOOK_DLQ", str(dlq))
+
+    calls = []
+    def fake_post_webhook(text, phrase):
+        calls.append((text, phrase))
+        return {"ok": False, "status_code": 500}
+
+    import sys as _sys
+    fake_module = types.SimpleNamespace(post_webhook=fake_post_webhook)
+    monkeypatch.setitem(_sys.modules, "elder_care", fake_module)
+
+    # Spy counter (no-op-compatible API).
+    inc_calls = []
+    class _SpyCounter:
+        def labels(self, **kw):
+            inc_calls.append(kw)
+            return self
+        def inc(self, *a, **k):
+            pass
+    fake_obs = types.SimpleNamespace(fall_webhook_outcome_total=_SpyCounter())
+    monkeypatch.setitem(_sys.modules, "brain_observability", fake_obs)
+
+    sleeps = []
+    result = fg._deliver_webhook_with_retry(
+        "hello", "fall_detected",
+        sleep_fn=lambda s: sleeps.append(s),
+    )
+
+    assert result == "failed"
+    assert len(calls) == 3
+    assert sleeps == [1.0, 4.0]
+    # DLQ line written exactly once.
+    assert dlq.exists()
+    line = dlq.read_text(encoding="utf-8").strip()
+    assert json.loads(line)["phrase"] == "fall_detected"
+    # Counter ticked exactly once on result=failed.
+    assert {"result": "failed"} in inc_calls
+
+
+# ── 11. M3: recreate-failure must not silently kill the worker ─────────────
+
+
+def test_recreate_failure_clears_pulse_and_logs(monkeypatch):
+    """When the periodic landmarker recreate raises, the loop must:
+      - log fallguard_landmarker_recreate_failed (ERROR)
+      - call clear_pulse_fn(name) so the watchdog forgets us
+      - return (no silent zombie)
+    """
+    # Replace module-level _make_pose_landmarker so the first call
+    # succeeds (initial build) and the second one (the recreate) raises.
+    build_count = {"n": 0}
+    class FakeLandmarker:
+        def detect(self, _img):
+            return types.SimpleNamespace(pose_landmarks=None)
+        def close(self):
+            pass
+    def fake_make(_path):
+        build_count["n"] += 1
+        if build_count["n"] >= 2:
+            raise RuntimeError("simulated recreate failure")
+        return FakeLandmarker()
+    monkeypatch.setattr(fg, "_make_pose_landmarker", fake_make)
+
+    monkeypatch.setenv("ELDER_FALLGUARD_ENABLED", "1")
+    monkeypatch.setenv("ELDER_FALLGUARD_RECREATE_S", "0.01")  # force recreate fast
+    monkeypatch.setenv("ELDER_FALLGUARD_HZ", "10")            # quick ticks
+    # Provide a fake model path that exists.
+    fake_model = Path(__file__).resolve().parent / "_fake_pose.task"
+    fake_model.write_bytes(b"")
+    monkeypatch.setenv("ELDER_FALLGUARD_MODEL", str(fake_model))
+
+    # Provide fake cv2 + mediapipe modules so the run_loop import-block
+    # doesn't bail out before we hit the recreate path.
+    import sys as _sys
+    fake_cv2 = types.SimpleNamespace(cvtColor=lambda x, _c: x, COLOR_BGR2RGB=0)
+    class _FakeImg:
+        def __init__(self, image_format=None, data=None): pass
+    fake_mp = types.SimpleNamespace(
+        Image=_FakeImg,
+        ImageFormat=types.SimpleNamespace(SRGB=0),
+    )
+    monkeypatch.setitem(_sys.modules, "cv2", fake_cv2)
+    monkeypatch.setitem(_sys.modules, "mediapipe", fake_mp)
+
+    class FakeLogger:
+        def __init__(self): self.errors = []
+        def info(self, ev, **kv): pass
+        def warning(self, ev, **kv): pass
+        def error(self, ev, **kv): self.errors.append(ev)
+    logger = FakeLogger()
+    cleared = []
+    pulsed = []
+
+    stop = __import__("threading").Event()
+    # Drive run_loop in foreground; force exit after a few ticks via the
+    # clear_pulse_fn side-channel (cleared name → set stop).
+    def clear_pulse_fn(name):
+        cleared.append(name)
+        stop.set()
+
+    fg.run_loop(
+        frame_getter=lambda: object(),  # never None so we hit detect()
+        stop_event=stop,
+        logger=logger,
+        pulse_fn=lambda n: pulsed.append(n),
+        clear_pulse_fn=clear_pulse_fn,
+    )
+
+    assert "fallguard_landmarker_recreate_failed" in logger.errors
+    assert cleared == ["fallguard"]
+    # Cleanup the dummy model file.
+    try: fake_model.unlink()
+    except Exception: pass
