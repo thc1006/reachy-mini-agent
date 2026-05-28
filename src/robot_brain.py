@@ -32,7 +32,12 @@ import pyaudio
 import scipy.signal
 import soundfile as sf
 from edge_tts import Communicate
-from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+    _HAS_FASTER_WHISPER = True
+except ImportError:
+    WhisperModel = None
+    _HAS_FASTER_WHISPER = False
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 
@@ -625,32 +630,42 @@ WHISPER_MODEL    = "large-v3-turbo"
 WHISPER_BEAM     = 3
 WHISPER_VAD      = True        # 內建 Silero VAD，自動略過無聲段 → 更快 + 更準
 
-print(f"載入 Whisper {WHISPER_MODEL}（CUDA / int8_float16, beam={WHISPER_BEAM}, vad={WHISPER_VAD}）...")
-try:
-    whisper_model = WhisperModel(
-        WHISPER_MODEL,
-        device="cuda",
-        compute_type="int8_float16",   # Ampere SM86 INT8 Tensor Core
-        cpu_threads=max(1, (os.cpu_count() or 8)),
-    )
-    _WHISPER_BACKEND = "gpu"
-    print(f"Whisper 就緒（GPU / int8_float16 / {WHISPER_MODEL}）")
-except Exception as _e:
-    print(f"GPU 載入失敗（{_e}），改用 CPU tiny / int8")
-    whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    _WHISPER_BACKEND = "cpu"
-    WHISPER_BEAM = 1
-    WHISPER_VAD = False
-    print("Whisper 就緒（CPU fallback）")
+# Skip local Whisper entirely when (a) faster_whisper isn't installed AND
+# (b) WHISPER_URL is set — the brain-on-Pi (Plan B, 2026-05-29) topology has
+# all STT remote on vllm0528:9000, so the heavy CUDA Whisper init is wasted.
+# When faster_whisper IS installed, keep the original GPU→CPU fallback path.
+_remote_whisper_only = (not _HAS_FASTER_WHISPER) and bool(os.getenv("WHISPER_URL", "").strip())
+if _remote_whisper_only:
+    print(f"略過本地 Whisper 載入（faster_whisper 未安裝、使用遠端 WHISPER_URL={os.environ['WHISPER_URL']}）")
+    whisper_model = None
+    _WHISPER_BACKEND = "remote-only"
+else:
+    print(f"載入 Whisper {WHISPER_MODEL}（CUDA / int8_float16, beam={WHISPER_BEAM}, vad={WHISPER_VAD}）...")
+    try:
+        whisper_model = WhisperModel(
+            WHISPER_MODEL,
+            device="cuda",
+            compute_type="int8_float16",   # Ampere SM86 INT8 Tensor Core
+            cpu_threads=max(1, (os.cpu_count() or 8)),
+        )
+        _WHISPER_BACKEND = "gpu"
+        print(f"Whisper 就緒（GPU / int8_float16 / {WHISPER_MODEL}）")
+    except Exception as _e:
+        print(f"GPU 載入失敗（{_e}），改用 CPU tiny / int8")
+        whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        _WHISPER_BACKEND = "cpu"
+        WHISPER_BEAM = 1
+        WHISPER_VAD = False
+        print("Whisper 就緒（CPU fallback）")
 
-# 預熱：第一次呼叫 cuDNN / kernel compile 約 1-2 秒，先跑一次假音訊避免延遲
-print("預熱 Whisper...")
-_t0 = time.time()
-_warm = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)   # 2 秒假訊號
-_warm[::100] = 0.01                                   # 微小 spike 讓 VAD 啟動
-list(whisper_model.transcribe(_warm, language="en", beam_size=WHISPER_BEAM,
-                              vad_filter=WHISPER_VAD)[0])
-print(f"預熱完成（{time.time()-_t0:.2f}s）\n")
+    # 預熱：第一次呼叫 cuDNN / kernel compile 約 1-2 秒，先跑一次假音訊避免延遲
+    print("預熱 Whisper...")
+    _t0 = time.time()
+    _warm = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)   # 2 秒假訊號
+    _warm[::100] = 0.01                                   # 微小 spike 讓 VAD 啟動
+    list(whisper_model.transcribe(_warm, language="en", beam_size=WHISPER_BEAM,
+                                  vad_filter=WHISPER_VAD)[0])
+    print(f"預熱完成（{time.time()-_t0:.2f}s）\n")
 
 # ── 動作庫 ────────────────────────────────────────────────────────────────────
 def do_action(mini, action: str):
