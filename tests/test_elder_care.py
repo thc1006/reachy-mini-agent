@@ -344,5 +344,144 @@ def test_robot_brain_extends_post_tts_pause():
 
 def test_robot_brain_fires_antenna_cue_on_vad_edge():
     src = (SRC / "robot_brain.py").read_text(encoding="utf-8")
-    assert 'fire_antenna_cue(mini, "listening")' in src
-    assert 'fire_antenna_cue(mini, "neutral")' in src
+    # Loose match — fix-loop added motion_lock kwarg, so substring without paren.
+    assert 'fire_antenna_cue(mini, "listening"' in src
+    assert 'fire_antenna_cue(mini, "neutral"' in src
+    # Fix-loop F3: motion_lock MUST be passed to prevent race with dance motor cmds.
+    assert "motion_lock=_motion_lock" in src
+
+
+# ── A4 fix-loop regression tests (2026-05-29 reviewer findings) ──────────
+
+@pytest.mark.parametrize("text", [
+    "I don't need help me",
+    "I do not need help me",
+    "do not call my son",
+    "don't call my daughter",
+    "I am not falling for that joke",
+    "won't call the nurse",
+    "我不需要 help me",
+    "不要叫我女兒",
+    "不要 help me",
+    "別叫護士",
+    "我不會跌倒",
+])
+def test_is_emergency_negation_rejects(text):
+    """Per A4 code-review F1: negation prefix (en + zh) must NOT trigger."""
+    assert elder_care.is_emergency(text) is None, f"FP on negated: {text!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "football fall game",            # bare "fall" no longer matches (needs -en/-ing)
+    "we played football this fall",  # same
+    "the fall season is nice",       # same
+    "fallout shelter",               # "fallout" — \b boundary works
+    "helpdesk number",               # "helpdesk" — \b boundary
+    "yelphelp.com review",           # "yelphelp" — \b boundary
+    "Hellper friends",               # close-but-not-help typo
+])
+def test_is_emergency_word_boundary_rejects(text):
+    """Per A4 code-review F1: word boundaries + bare-fall removal reject
+    common substring false positives."""
+    assert elder_care.is_emergency(text) is None, f"FP on substring: {text!r}"
+
+
+def test_is_emergency_negation_window_is_intentionally_wide():
+    """Tradeoff doc: any negator within the preceding ~40 chars blocks the
+    match. Edge case ('I'm not joking, help me!') will FALSE-NEGATIVE.
+    For elder care this is acceptable — spurious family alerts are worse
+    than a missed sarcastic phrasing (elders don't phrase real emergencies
+    sarcastically)."""
+    # This phrasing intentionally does NOT fire (the wide negation window).
+    assert elder_care.is_emergency("I'm not joking, help me") is None
+    # But a plain real emergency without negation always fires.
+    assert elder_care.is_emergency("Please help me, I fell") == "help me"
+
+
+def test_is_emergency_preserved_positives_still_work():
+    """Sanity: tightening regex must NOT regress real emergencies."""
+    cases = ["help me", "救命", "I'm falling", "胸痛", "不能呼吸",
+             "Call my daughter", "叫我女兒", "she has fallen"]
+    for t in cases:
+        assert elder_care.is_emergency(t) is not None, f"FN: {t!r}"
+
+
+def test_post_webhook_rejects_non_http_scheme():
+    """Per A4 code-review F4: file://, ftp:// etc. must not be fetched."""
+    assert elder_care.post_webhook("x", "y", url="file:///etc/passwd") is False
+    assert elder_care.post_webhook("x", "y", url="ftp://example.com/") is False
+    assert elder_care.post_webhook("x", "y", url="javascript:alert(1)") is False
+
+
+def test_log_emergency_honors_env_path_override(tmp_path, monkeypatch):
+    """Per A4 code-review F2: ELDER_EMERGENCY_LOG_PATH env wins over default."""
+    p = tmp_path / "custom.log"
+    monkeypatch.setenv("ELDER_EMERGENCY_LOG_PATH", str(p))
+    assert elder_care.log_emergency("text", "phrase") is True
+    rec = json.loads(p.read_text().strip())
+    assert rec["phrase"] == "phrase"
+
+
+def test_handle_emergency_async_webhook_does_not_block(tmp_path, monkeypatch):
+    """Per A4 F3: default webhook_async=True returns immediately even when
+    the URL would timeout. We don't wait for the thread to complete; we just
+    verify the call returned fast and the result indicates async dispatch."""
+    import time
+    monkeypatch.setenv("ELDER_EMERGENCY_LOG_PATH", str(tmp_path / "e.log"))
+    monkeypatch.setenv("ELDER_EMERGENCY_WEBHOOK_URL", "http://127.0.0.1:1/never")
+    t0 = time.perf_counter()
+    res = elder_care.handle_emergency("救命", "救命", speak_fn=None)
+    dt = time.perf_counter() - t0
+    assert dt < 0.5, f"handle_emergency blocked {dt:.2f}s (must be <0.5s async)"
+    assert res["webhook"] == "dispatched_async"
+
+
+def test_handle_emergency_sync_webhook_for_test_visibility(tmp_path, monkeypatch):
+    """webhook_async=False path still works for tests that need to inspect
+    the actual True/False result of the POST."""
+    monkeypatch.setenv("ELDER_EMERGENCY_LOG_PATH", str(tmp_path / "e.log"))
+    monkeypatch.delenv("ELDER_EMERGENCY_WEBHOOK_URL", raising=False)  # no URL → False
+    res = elder_care.handle_emergency("救命", "救命", speak_fn=None, webhook_async=False)
+    assert res["webhook"] is False
+
+
+def test_fire_antenna_cue_skips_when_lock_busy(elder_on, monkeypatch):
+    """Per A4 architect F3: if motion_lock is held by another motor worker,
+    antenna cue must skip silently (not race + jerky motion)."""
+    import threading
+    lock = threading.Lock()
+    lock.acquire()  # simulate dance worker holding the lock
+    calls = []
+    class FakeMini:
+        def goto_target(self, **kw): calls.append(kw)
+    try:
+        ok = elder_care.fire_antenna_cue(FakeMini(), "listening", motion_lock=lock)
+        assert ok is False
+        assert calls == [], "must not issue goto_target when lock busy"
+    finally:
+        lock.release()
+
+
+def test_fire_antenna_cue_acquires_lock_and_releases(elder_on, monkeypatch):
+    """When lock is FREE, antenna cue acquires it, issues the call, releases."""
+    import threading
+    lock = threading.Lock()
+    calls = []
+    class FakeMini:
+        def goto_target(self, **kw): calls.append(kw)
+    ok = elder_care.fire_antenna_cue(FakeMini(), "listening", motion_lock=lock)
+    assert ok is True
+    assert len(calls) == 1
+    # Lock must be released after the call (acquire-able again).
+    assert lock.acquire(blocking=False) is True
+    lock.release()
+
+
+def test_fire_antenna_cue_without_lock_still_works(elder_on, monkeypatch):
+    """motion_lock arg is optional — back-compat with v1 callers (none ship today)."""
+    calls = []
+    class FakeMini:
+        def goto_target(self, **kw): calls.append(kw)
+    ok = elder_care.fire_antenna_cue(FakeMini(), "neutral")  # no motion_lock
+    assert ok is True
+    assert len(calls) == 1

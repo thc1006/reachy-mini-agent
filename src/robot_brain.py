@@ -1162,7 +1162,7 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
             # (first transition silent → speech this utterance). Cheap to call
             # but firing every frame would queue redundant motor commands.
             if not has_speech:
-                elder_care.fire_antenna_cue(mini, "listening")
+                elder_care.fire_antenna_cue(mini, "listening", motion_lock=_motion_lock)
             has_speech = True
             silent_s = 0.0
             print("▪", end="", flush=True)
@@ -1173,7 +1173,7 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
     print()
     # P8 — return antennas to neutral once we stop listening, regardless of
     # whether speech was captured (cue must not leave the antennas tilted).
-    elder_care.fire_antenna_cue(mini, "neutral")
+    elder_care.fire_antenna_cue(mini, "neutral", motion_lock=_motion_lock)
     return np.concatenate(chunks) if has_speech else None
 
 def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
