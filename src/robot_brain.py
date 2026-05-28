@@ -9,6 +9,7 @@ Reachy Mini — 眼神追蹤 + 對話互動系統
 """
 import asyncio
 import enum
+import gc
 import hashlib
 import io
 import json
@@ -427,17 +428,27 @@ if not os.path.exists(HAND_MODEL_PATH):
     urllib.request.urlretrieve(url, HAND_MODEL_PATH)
     print("下載完成")
 
-hand_landmarker = HandLandmarker.create_from_options(
-    HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=HAND_MODEL_PATH),
-        running_mode=_MPRunMode.IMAGE,
-        num_hands=2,
-        min_hand_detection_confidence=0.55,
-        min_hand_presence_confidence=0.55,
-        min_tracking_confidence=0.5,
+def _make_hand_landmarker():
+    return HandLandmarker.create_from_options(
+        HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=HAND_MODEL_PATH),
+            running_mode=_MPRunMode.IMAGE,
+            num_hands=2,
+            min_hand_detection_confidence=0.55,
+            min_hand_presence_confidence=0.55,
+            min_tracking_confidence=0.5,
+        )
     )
-)
+
+# IMAGE-mode HandLandmarker leaks ~30 MB/min on aarch64 even with
+# mediapipe 0.10.14 (GitHub mediapipe#5217 / #4785 — C++ packet graph
+# retains per-call allocations until graph teardown). Brain on Pi was
+# auto-restart-cycling every ~16 min via watchdog (A1 diagnostic, Wave3-P2).
+# Mitigation: periodic .close()+recreate inside hand_worker (every
+# HAND_LANDMARKER_RECREATE_S seconds, default 300s).
+hand_landmarker = _make_hand_landmarker()
 _hand_lock = threading.Lock()  # mediapipe 不保證 thread-safe
+_hand_call_count = 0           # for periodic gc.collect() (every 50 detect() calls)
 
 def _count_one_hand(lm) -> int:
     """一隻手 21 landmark → 伸出手指數（0-5）"""
@@ -457,6 +468,7 @@ def _count_one_hand(lm) -> int:
     return n
 
 def count_fingers_in_frame(frame_bgr) -> int:
+    global _hand_call_count
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     with _hand_lock:
@@ -468,6 +480,14 @@ def count_fingers_in_frame(frame_bgr) -> int:
     total = 0
     for lm_list in (result.hand_landmarks or []):
         total += _count_one_hand(lm_list)
+    # Interim leak mitigation: drop heavy refs + force a gen-0 collect every
+    # 50 calls. count_fingers_in_frame at 5 Hz → ~10s cadence — negligible
+    # CPU, but trims Python-side cycle-buffer growth that compounds the C++
+    # leak in mediapipe#5217.
+    _hand_call_count += 1
+    if _hand_call_count % 50 == 0:
+        del mp_img, rgb
+        gc.collect()
     return total
 
 # ── 手勢反應台詞 + 分享給 hand_worker 的最新畫面 ────────────────────────────
@@ -487,21 +507,46 @@ _latest_frame   = None   # tracking thread 每迴圈寫入；hand_worker 讀
 _latest_frame_t = 0.0
 
 def hand_worker(mini, stop_event: threading.Event):
-    """每 100ms 做一次手勢偵測（~10Hz），跟 tracking thread 解耦"""
-    HAND_STABLE_SAMPLES  = 5     # 連續 5 次同數字觸發 (~0.5s)
+    """每 200ms 做一次手勢偵測（~5Hz），跟 tracking thread 解耦
+
+    Wave3-P2 mitigation for MediaPipe HandLandmarker leak (mediapipe#5217,
+    #4785): dropped from 10Hz→5Hz (halves leak rate, UX impact negligible
+    — 5-sample stability still hits in ~1s) and periodically .close()s the
+    landmarker so the leaked C++ packet-graph allocations are reclaimed
+    (controlled by HAND_LANDMARKER_RECREATE_S, default 300s).
+    """
+    global hand_landmarker
+    HAND_STABLE_SAMPLES  = 5     # 連續 5 次同數字觸發 (~1.0s @ 5Hz)
     HAND_REACT_COOLDOWN  = 5.0   # 觸發後 5s 不再重觸發
+    RECREATE_S = float(os.getenv("HAND_LANDMARKER_RECREATE_S", "300"))
     last_count   = -1
     stable       = 0
     react_until  = 0.0
-    print("  [手勢 worker] 啟動")
+    last_recreate = time.time()
+    print(f"  [手勢 worker] 啟動 (5 Hz, recreate every {RECREATE_S:.0f}s)")
     while not stop_event.is_set():
-        time.sleep(0.1)
-        if time.time() < react_until:
-            continue
+        time.sleep(0.2)  # 5 Hz (was 0.1 / 10 Hz pre-Wave3-P2)
+        # Early state-gate: skip cv2 colour-convert + mediapipe detect when
+        # brain isn't actively engaged. IDLE / CONVERSATION / COOLDOWN don't
+        # need finger counting — this avoids ~90% of detect() calls and is
+        # the single biggest contributor to the leak-rate reduction.
         state = get_state()
         if state not in (State.TRACKING, State.GREETING):
             last_count, stable = -1, 0
             continue
+        if time.time() < react_until:
+            continue
+        # Periodic recreate to flush leaked C++ packet-graph allocations.
+        if RECREATE_S > 0 and time.time() - last_recreate >= RECREATE_S:
+            with _hand_lock:
+                try:
+                    hand_landmarker.close()
+                except Exception as e:
+                    print(f"  [手勢 landmarker close 錯誤] {e}")
+                hand_landmarker = _make_hand_landmarker()
+            gc.collect()
+            last_recreate = time.time()
+            print("  [手勢 worker] HandLandmarker recreated (leak mitigation)")
         frame_ref = _latest_frame
         if frame_ref is None or time.time() - _latest_frame_t > 0.3:
             continue
