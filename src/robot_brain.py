@@ -1292,7 +1292,13 @@ def _transcribe_via_5090(audio: np.ndarray) -> str | None:
                 audio_s = len(audio) / SAMPLE_RATE
                 rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
                 print(f"  [STT faster-whisper/large-v3-turbo GPU] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
-                return (data.get("text") or "").strip()
+                _text = (data.get("text") or "").strip()
+                # Visibility: remote VAD/no_speech rejection returns empty text;
+                # do_conversation's `if not text: continue` would otherwise swallow
+                # silently — we then never see why LLM wasn't called.
+                if not _text and audio_s > 0.5:
+                    print(f"  [STT empty result remote] {audio_s:.1f}s audio → server returned no text")
+                return _text
             except _urlreq.HTTPError as e:
                 if e.code == 404 and _WHISPER_REMOTE_KIND == "auto":
                     # Endpoint mismatch — fall through to whisper.cpp /inference
@@ -1323,7 +1329,10 @@ def _transcribe_via_5090(audio: np.ndarray) -> str | None:
         audio_s = len(audio) / SAMPLE_RATE
         rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
         print(f"  [STT whisper.cpp/large-v3-turbo GPU] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
-        return (data.get("text") or "").strip()
+        _text = (data.get("text") or "").strip()
+        if not _text and audio_s > 0.5:
+            print(f"  [STT empty result remote] {audio_s:.1f}s audio → server returned no text")
+        return _text
     except Exception as e:
         print(f"  [STT remote 失敗] {e}, fallback local")
         return None
