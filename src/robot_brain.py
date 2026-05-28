@@ -9,7 +9,6 @@ Reachy Mini — 眼神追蹤 + 對話互動系統
 """
 import asyncio
 import enum
-import gc
 import hashlib
 import io
 import json
@@ -59,13 +58,6 @@ except ImportError:
     _HAS_FASTER_WHISPER = False
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
-
-# MediaPipe 手勢偵測（新版 tasks API）
-import mediapipe as mp
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import (
-    HandLandmarker, HandLandmarkerOptions, RunningMode as _MPRunMode,
-)
 
 # 用所有實體核心跑 OpenCV（i5-11320H = 4C/8T）
 cv2.setNumThreads(max(1, (os.cpu_count() or 8)))
@@ -449,167 +441,22 @@ def set_state(s: State):
     except Exception:
         pass
 
-# ── MediaPipe 手部偵測（CPU, 小巧, 每 3 幀跑一次）───────────────────────────
-HAND_MODEL_PATH = "hand_landmarker.task"
-if not os.path.exists(HAND_MODEL_PATH):
-    import urllib.request
-    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-    print(f"下載 hand_landmarker 模型到 {HAND_MODEL_PATH} ...")
-    urllib.request.urlretrieve(url, HAND_MODEL_PATH)
-    print("下載完成")
-
-def _make_hand_landmarker():
-    return HandLandmarker.create_from_options(
-        HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=HAND_MODEL_PATH),
-            running_mode=_MPRunMode.IMAGE,
-            num_hands=2,
-            min_hand_detection_confidence=0.55,
-            min_hand_presence_confidence=0.55,
-            min_tracking_confidence=0.5,
-        )
-    )
-
-# IMAGE-mode HandLandmarker leaks ~30 MB/min on aarch64 even with
-# mediapipe 0.10.14 (GitHub mediapipe#5217 / #4785 — C++ packet graph
-# retains per-call allocations until graph teardown). Brain on Pi was
-# auto-restart-cycling every ~16 min via watchdog (A1 diagnostic, Wave3-P2).
-# Mitigation: periodic .close()+recreate inside hand_worker (every
-# HAND_LANDMARKER_RECREATE_S seconds, default 300s).
-#
-# Wave6-P1 #93: HAND_LANDMARKER_ENABLED master switch. Default 1 keeps the
-# Wave3-P2 behaviour (spawn hand_worker + run HandLandmarker with periodic
-# recreate). Set to 0 to fully disable hand_worker for Phase 1 leak
-# mitigation per sub-agent #100 GO recommendation; finger-counting feature
-# is lost but vision_worker / elder_fallguard are unaffected (they read
-# _latest_frame written by tracking_loop). Phase 2 (#94) will remove the
-# code path entirely after soak observation.
-_HAND_LANDMARKER_ENABLED = os.getenv("HAND_LANDMARKER_ENABLED", "1") != "0"
-hand_landmarker = _make_hand_landmarker()
-_hand_lock = threading.Lock()  # mediapipe 不保證 thread-safe
-_hand_call_count = 0           # for periodic gc.collect() (every 50 detect() calls)
-
-def _count_one_hand(lm) -> int:
-    """一隻手 21 landmark → 伸出手指數（0-5）"""
-    # 掌長當尺度（wrist 0 → middle MCP 9）
-    palm = ((lm[0].x - lm[9].x) ** 2 + (lm[0].y - lm[9].y) ** 2) ** 0.5
-    if palm < 0.02:
-        return 0
-    n = 0
-    # 食/中/無名/小：tip.y < pip.y → 伸直（畫面座標 y 向下）
-    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
-        if lm[tip].y < lm[pip].y - 0.01:
-            n += 1
-    # 拇指：tip 到 wrist 距離大於 1.3×掌長視為伸直
-    thumb = ((lm[4].x - lm[0].x) ** 2 + (lm[4].y - lm[0].y) ** 2) ** 0.5
-    if thumb > palm * 1.3:
-        n += 1
-    return n
-
-def count_fingers_in_frame(frame_bgr) -> int:
-    global _hand_call_count
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    with _hand_lock:
-        try:
-            result = hand_landmarker.detect(mp_img)
-        except Exception as e:
-            print(f"  [手勢偵測錯誤] {e}")
-            return 0
-    total = 0
-    for lm_list in (result.hand_landmarks or []):
-        total += _count_one_hand(lm_list)
-    # Interim leak mitigation: drop heavy refs + force a gen-0 collect every
-    # 50 calls. count_fingers_in_frame at 5 Hz → ~10s cadence — negligible
-    # CPU, but trims Python-side cycle-buffer growth that compounds the C++
-    # leak in mediapipe#5217.
-    _hand_call_count += 1
-    if _hand_call_count % 50 == 0:
-        del mp_img, rgb
-        gc.collect()
-    return total
-
-# ── 手勢反應台詞 + 分享給 hand_worker 的最新畫面 ────────────────────────────
-FINGER_LINES = {
-    1: ["One.",  "Number one."],
-    2: ["Two.",  "Peace."],
-    3: ["Three."],
-    4: ["Four."],
-    5: ["High five.", "Five."],
-    6: ["Six."],
-    7: ["Seven."],
-    8: ["Eight."],
-    9: ["Nine."],
-    10: ["Ten.", "All ten."],
-}
-_latest_frame   = None   # tracking thread 每迴圈寫入；hand_worker 讀
+# ── Latest camera frame (shared by tracking_loop → vision_worker/fallguard) ──
+# Wave6-P2 #94: The MediaPipe HandLandmarker code path (count_fingers_in_frame,
+# hand_worker, _make_hand_landmarker, _hand_lock, FINGER_LINES, HAND_*
+# env vars) has been deleted entirely. Background: IMAGE-mode HandLandmarker
+# leaked ~30 MB/min on aarch64 (mediapipe#5217 / #4785, C++ packet graph
+# retains per-call allocations), causing systemd-watchdog restart-cycling
+# every ~16 min on the Pi. Wave3-P2 mitigated via periodic .close()+recreate;
+# Wave6-P1 (#93) added HAND_LANDMARKER_ENABLED master switch (defaulted to 1,
+# Pi production set 0). Per user direction ("其實不常用到") + sub-agent #100
+# GO recommendation, Phase 2 removes the code path entirely to permanently
+# eliminate the leak source. vision_worker and elder_fallguard are unaffected
+# — they read _latest_frame written by tracking_loop. MediaPipe is still a
+# project dep because elder_fallguard.py uses PoseLandmarker (different
+# module, different leak profile — handled by its own periodic recreate).
+_latest_frame   = None   # tracking thread 每迴圈寫入；vision_worker / fallguard 讀
 _latest_frame_t = 0.0
-
-def hand_worker(mini, stop_event: threading.Event):
-    """每 200ms 做一次手勢偵測（~5Hz），跟 tracking thread 解耦
-
-    Wave3-P2 mitigation for MediaPipe HandLandmarker leak (mediapipe#5217,
-    #4785): dropped from 10Hz→5Hz (halves leak rate, UX impact negligible
-    — 5-sample stability still hits in ~1s) and periodically .close()s the
-    landmarker so the leaked C++ packet-graph allocations are reclaimed
-    (controlled by HAND_LANDMARKER_RECREATE_S, default 300s).
-    """
-    global hand_landmarker
-    HAND_STABLE_SAMPLES  = 5     # 連續 5 次同數字觸發 (~1.0s @ 5Hz)
-    HAND_REACT_COOLDOWN  = 5.0   # 觸發後 5s 不再重觸發
-    RECREATE_S = float(os.getenv("HAND_LANDMARKER_RECREATE_S", "300"))
-    last_count   = -1
-    stable       = 0
-    react_until  = 0.0
-    last_recreate = time.time()
-    print(f"  [手勢 worker] 啟動 (5 Hz, recreate every {RECREATE_S:.0f}s)")
-    while not stop_event.is_set():
-        obs.pulse("hand_worker")
-        time.sleep(0.2)  # 5 Hz (was 0.1 / 10 Hz pre-Wave3-P2)
-        # Early state-gate: skip cv2 colour-convert + mediapipe detect when
-        # brain isn't actively engaged. IDLE / CONVERSATION / COOLDOWN don't
-        # need finger counting — this avoids ~90% of detect() calls and is
-        # the single biggest contributor to the leak-rate reduction.
-        state = get_state()
-        if state not in (State.TRACKING, State.GREETING):
-            last_count, stable = -1, 0
-            continue
-        if time.time() < react_until:
-            continue
-        # Periodic recreate to flush leaked C++ packet-graph allocations.
-        if RECREATE_S > 0 and time.time() - last_recreate >= RECREATE_S:
-            with _hand_lock:
-                try:
-                    hand_landmarker.close()
-                except Exception as e:
-                    print(f"  [手勢 landmarker close 錯誤] {e}")
-                hand_landmarker = _make_hand_landmarker()
-            gc.collect()
-            last_recreate = time.time()
-            print("  [手勢 worker] HandLandmarker recreated (leak mitigation)")
-        frame_ref = _latest_frame
-        if frame_ref is None or time.time() - _latest_frame_t > 0.3:
-            continue
-        try:
-            n = count_fingers_in_frame(frame_ref)
-        except Exception as e:
-            print(f"  [手勢 worker 錯誤] {e}")
-            continue
-        if n > 0:
-            if n == last_count:
-                stable += 1
-            else:
-                last_count, stable = n, 1
-            if stable >= HAND_STABLE_SAMPLES:
-                stable = 0
-                react_until = time.time() + HAND_REACT_COOLDOWN
-                line = random.choice(FINGER_LINES.get(n, [f"I see {n} fingers!"]))
-                print(f"  [手勢] {n} 指 → {line}", flush=True)
-                threading.Thread(target=lambda l=line: speak(mini, l),
-                                 daemon=True).start()
-        else:
-            last_count, stable = 0, 0
-    print("  [手勢 worker] 結束")
 
 # ── Vision worker（2026-04-21 升級 Qwen3.6 原生視覺取代 qwen2.5vl）──────────
 # 每 N 秒 caption 塞進 LLM system prompt；qwen3.6 MMMU 81.7 > qwen2.5vl:7b ~70
@@ -2921,7 +2768,7 @@ def tracking_loop(mini, stop_event: threading.Event):
                     speak(mini, l)
             threading.Thread(target=idle_action, daemon=True).start()
 
-        # 共享最新 frame 給 hand_worker thread
+        # 共享最新 frame 給 vision_worker / elder_fallguard
         global _latest_frame, _latest_frame_t
         _latest_frame = frame
         _latest_frame_t = time.time()
@@ -3047,15 +2894,9 @@ def main():
         # reading by the time its first frame fires (1 s poll interval).
         motor_st.start()
         tracker.start()
-        # Wave6-P1 #93: hand_worker spawn now gated by HAND_LANDMARKER_ENABLED
-        # (default 1 = backwards compatible). When 0, MediaPipe HandLandmarker
-        # is never invoked from a worker thread; vision_worker still reads
-        # _latest_frame normally so the rest of the brain is unaffected.
-        if _HAND_LANDMARKER_ENABLED:
-            hands  = threading.Thread(target=hand_worker, args=(mini, stop_event), daemon=True)
-            hands.start()
-        else:
-            logger.info("hand_landmarker_disabled", reason="HAND_LANDMARKER_ENABLED=0")
+        # Wave6-P2 #94: hand_worker thread + MediaPipe HandLandmarker code
+        # path deleted entirely. vision_worker continues to read _latest_frame
+        # published by tracking_loop (single-owner camera invariant preserved).
         vision.start()
 
         # Wave4-P4 (#74) ElderFallGuard: MediaPipe Pose fall detector. NO new
@@ -3066,7 +2907,8 @@ def main():
         try:
             import elder_fallguard as _fg
             def _fg_frame_getter():
-                # Stale-frame guard mirrors hand_worker: refuse frames > 1 s old.
+                # Stale-frame guard: refuse frames > 1 s old (was mirrored
+                # from the now-deleted hand_worker pattern in Wave3-P2).
                 if _latest_frame is None or (time.time() - _latest_frame_t) > 1.0:
                     return None
                 return _latest_frame
@@ -3095,11 +2937,9 @@ def main():
         mic_src = "機器人麥克風" if USE_ROBOT_MIC else "電腦麥克風"
         print(f"說話請對著【{mic_src}】\n")
         _sd_notify("READY=1")
-        _ready_threads = ["tracking_loop", "vision_worker"]
-        if _HAND_LANDMARKER_ENABLED:
-            _ready_threads.insert(1, "hand_worker")
+        # Wave6-P2 #94: hand_worker removed from thread inventory.
         logger.info("brain_ready",
-                    threads=_ready_threads,
+                    threads=["tracking_loop", "vision_worker"],
                     mic=mic_src)
         # M-M4: eager-warm Mem0 in a background thread so the first user
         # turn doesn't pay the cold-load tax (FastEmbed model dl + Qdrant
@@ -3134,13 +2974,9 @@ def main():
         # conversation), incorrectly tripping the systemd watchdog. It
         # registers itself on first pulse when a real conversation begins;
         # if a turn hangs >60 s the watchdog correctly gates — that's intent.
-        # Wave6-P1 #93: only seed hand_worker pulse when HAND_LANDMARKER_ENABLED
-        # — otherwise the watchdog would mark it as stale immediately since the
-        # thread was never spawned, tripping a spurious systemd restart.
-        _seed_threads = ["tracking_loop", "vision_worker", "main_idle"]
-        if _HAND_LANDMARKER_ENABLED:
-            _seed_threads.insert(1, "hand_worker")
-        for _name in _seed_threads:
+        # Wave6-P2 #94: hand_worker removed from seed list (thread no longer
+        # spawned; seeding would mark it stale immediately and trip systemd).
+        for _name in ("tracking_loop", "vision_worker", "main_idle"):
             obs.pulse(_name)
         # ARM the watchdog AFTER seeding pulses. From this moment, if 30 s
         # pass with still no heartbeats, the watchdog treats the brain as
