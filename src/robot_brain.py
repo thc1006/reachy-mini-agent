@@ -476,13 +476,23 @@ _scene_lock   = threading.Lock()
 _llm_dialog_active = threading.Event()
 
 def vision_worker(stop_event: threading.Event):
-    import urllib.request as _vreq
     import base64 as _b64
-    VISION_URL      = os.getenv("VISION_URL", os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-    VISION_MODEL    = os.getenv("VISION_MODEL", "qwen3.6:35b-a3b")   # 預設用主 LLM；env 可 override
+    # Vision endpoint is fully controlled by VISION_URL / VISION_MODEL via
+    # robot_tools._ask_vision() — LLM_BACKEND (which steers dialog) is
+    # intentionally NOT consulted here. Previously this worker ran its own
+    # POST loop that hardcoded f"{VLLM_HOST}/v1/chat/completions" when
+    # LLM_BACKEND=vllm, which silently bypassed VISION_URL and routed VL
+    # requests to the text-only dialog model on port 8000 (crash / 404 /
+    # garbage). See commit 44695e9 (Option A) and the adversarial review
+    # RED finding (a33e6d474f963ae34).
+    from robot_tools import _ask_vision, _vision_endpoint
     VISION_INTERVAL = float(os.getenv("VISION_INTERVAL", "30"))
-    print(f"  [視覺 worker] 啟動（{VISION_MODEL} @ {VISION_URL}, every {VISION_INTERVAL}s）")
+    _vurl, _vmodel = _vision_endpoint()
+    print(f"  [視覺 worker] 啟動（{_vmodel} @ {_vurl}, every {VISION_INTERVAL}s）")
     global _scene_desc, _scene_desc_t
+    PROMPT = ("In ONE short sentence (<=20 words), describe what you see — "
+              "focus on the person: clothes, hair, expression, what they seem "
+              "to be doing. No intro, just the description.")
     while not stop_event.is_set():
         obs.pulse("vision_worker")
         time.sleep(VISION_INTERVAL)
@@ -511,52 +521,29 @@ def vision_worker(stop_event: threading.Event):
                 continue
             img_b64 = _b64.b64encode(jpg.tobytes()).decode("ascii")
             t0 = time.perf_counter()
-            payload = {
-                "model": VISION_MODEL,
-                "stream": False,
-                "think": False,                    # qwen3.6 等 thinking 模型要顯式關，不然 num_predict 會被思考吃光
-                "keep_alive": "30m",
-                "options": {"temperature": 0.3, "num_predict": 60, "num_ctx": 2048},
-                "messages": [{
-                    "role": "user",
-                    "content": ("In ONE short sentence (<=20 words), describe what you see — "
-                                "focus on the person: clothes, hair, expression, what they seem "
-                                "to be doing. No intro, just the description."),
-                    "images": [img_b64],
-                }],
-            }
-            if LLM_BACKEND == "vllm":
-                send_payload = _ollama_to_openai_payload(payload)
-                send_payload.pop("stream", None)
-                send_payload["stream"] = False
-                url = f"{VLLM_HOST}/v1/chat/completions"
-            else:
-                send_payload = payload
-                url = f"{VISION_URL}/api/chat"
-            req = _vreq.Request(
-                url,
-                data=json.dumps(send_payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-            with _vreq.urlopen(req, timeout=40) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
+            desc = _ask_vision(PROMPT, img_b64, num_predict=60,
+                               temperature=0.3, timeout=40)
             # H-O4 fix: pulse AGAIN right after the slow VL HTTP call returns
             # so a long (30-60 s) but successful inference doesn't leave the
             # heartbeat as old as `before-call` for an entire VISION_INTERVAL
             # cycle. Without this, a single slow call followed by the sleep()
             # could push min-age past the 90 s watchdog threshold.
             obs.pulse("vision_worker")
-            data = (
-                _openai_to_ollama_response(raw) if LLM_BACKEND == "vllm" else raw
-            )
-            desc = (data.get("message", {}).get("content") or "").strip()
+            desc = (desc or "").strip()
             dur_ms = (time.perf_counter() - t0) * 1000
             if desc:
                 with _scene_lock:
                     _scene_desc = desc
                     _scene_desc_t = time.time()
+                logger.info("vision_scene_desc",
+                            chars=len(desc), latency_ms=round(dur_ms, 1))
                 print(f"  [視覺] {dur_ms:.0f}ms: {desc[:90]}", flush=True)
+            else:
+                logger.info("vision_scene_desc_empty",
+                            latency_ms=round(dur_ms, 1))
         except Exception as e:
+            logger.error("vision_scene_desc_error",
+                         err=str(e), err_type=type(e).__name__)
             print(f"  [視覺錯誤] {e}", flush=True)
     print("  [視覺 worker] 結束")
 
