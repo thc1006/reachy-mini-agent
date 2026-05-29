@@ -556,6 +556,47 @@ def _tool_count_items(description: str = "", **_kwargs) -> dict:
     return out
 
 
+def _tool_query_vision(question: str = "", **_kwargs) -> dict:
+    """Ask the VLM a specific, on-demand question about the current camera frame.
+
+    Distinct from `see_what` (which is optional-query + 1-2 sentence caption):
+    `query_vision` REQUIRES a `question` and returns a focused, short answer
+    suitable for direct synthesis by the dialog LLM. Use when the periodic
+    LATEST_SCENE_DESC (every VISION_INTERVAL s, generic 4-part prompt) does
+    not cover the user's question — e.g. "is the cup on the table?",
+    "what is the user holding in their right hand?".
+
+    Sync from LLM's perspective; 20 s timeout cap so a hung VLM cannot freeze
+    the brain. Stateless (no caching) — keeps Pi RAM footprint flat.
+
+    Metrics + structured log emitted by the brain dispatcher (which wraps
+    `execute_tool`) so this helper stays Pi-cheap and import-light.
+    """
+    question = (question or "").strip()
+    if not question:
+        return {"error": "question argument is required"}
+    b64 = _get_frame_b64()
+    if b64 is None:
+        # Canned answer so the LLM can synthesize a graceful fallback instead
+        # of a JSON-shaped error leaking to the user.
+        return {"answer": "I can't see anything right now — the camera isn't ready."}
+    # Sanitize to keep injected prose out of the VL prompt envelope.
+    safe_q = _sanitize_description(question, limit=240)
+    prompt = (
+        "You are looking through the robot's camera. Answer the following "
+        "question in 1-2 short, concrete sentences based ONLY on what is "
+        f"visible in this image:\n{safe_q}\n"
+        "If the answer is not visible, say so plainly."
+    )
+    try:
+        raw = _ask_vision(prompt, b64, num_predict=120, temperature=0.2, timeout=20)
+    except Exception as e:
+        return {"error": f"vision call failed: {type(e).__name__}: {e}"}
+    if not raw:
+        return {"error": "vision model returned empty"}
+    return {"answer": raw.strip(), "question": question}
+
+
 def _tool_recall_memory(query: str = "", max_results: int = 3, **_kwargs) -> dict:
     """Search conversation_log.jsonl for turns whose user-or-robot text contains
     `query` (case-insensitive substring). Returns up to `max_results` most recent."""
@@ -668,6 +709,21 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
               {"description": {"type": "string", "description": "What class of item to count, e.g. 'people', 'books', 'pens'."}},
               required=["description"]),
         _tool_count_items,
+    ),
+    # Wave6-P4 (2026-05-29): on-demand precise visual query. Distinct from
+    # see_what (optional query, 1-2 sentence caption) — query_vision REQUIRES
+    # a question and is the preferred tool when the user asks something
+    # specific that the periodic LATEST_SCENE_DESC may not cover.
+    "query_vision": (
+        _spec("query_vision",
+              "Ask the vision model a specific question about what is currently visible "
+              "(e.g. 'what is the user holding in their right hand?', 'what color is the "
+              "person's shirt?', 'is the cup on the table?'). Use this when the user asks "
+              "about something specific in the visual scene that the periodic scene "
+              "description may not cover. Returns the VLM's answer as a string.",
+              {"question": {"type": "string", "description": "The specific question to ask the vision model about the current view."}},
+              required=["question"]),
+        _tool_query_vision,
     ),
 }
 

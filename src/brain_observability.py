@@ -284,6 +284,12 @@ motion_actions_total: object = _NoOpMetric()
 motion_queue_depth: object = _NoOpMetric()
 motion_run_seconds: object = _NoOpMetric()
 
+# Wave6-P4 (2026-05-29): on-demand VLM tool_call observability. Counts each
+# LLM-emitted `query_vision` invocation broken down by outcome so we can spot
+# VLM timeouts / empty responses vs the implicit success path (periodic
+# vision_worker on a separate counter elsewhere).
+vision_tool_call_total: object = _NoOpMetric()
+
 _metrics_initialized = False
 _metrics_init_lock = threading.Lock()
 
@@ -295,6 +301,7 @@ def init_metrics() -> bool:
     global llm_fallback_total, stt_fallback_total, tts_fallback_total
     global fall_events_total, fall_state, fall_webhook_outcome_total
     global motion_actions_total, motion_queue_depth, motion_run_seconds
+    global vision_tool_call_total
     global _metrics_initialized
     if not _HAS_PROMETHEUS:
         return False
@@ -386,6 +393,11 @@ def init_metrics() -> bool:
                 "brain_motion_run_seconds",
                 "Wall time from MotionQueue start→completed/aborted per action",
                 buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+            )
+            vision_tool_call_total = Counter(
+                "brain_vision_tool_call_total",
+                "LLM-emitted query_vision tool_call outcomes",
+                ["result"],  # success | error | timeout | no_frame
             )
             _metrics_initialized = True
             return True

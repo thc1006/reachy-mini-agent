@@ -490,9 +490,15 @@ def vision_worker(stop_event: threading.Event):
     _vurl, _vmodel = _vision_endpoint()
     print(f"  [視覺 worker] 啟動（{_vmodel} @ {_vurl}, every {VISION_INTERVAL}s）")
     global _scene_desc, _scene_desc_t
-    PROMPT = ("In ONE short sentence (<=20 words), describe what you see — "
-              "focus on the person: clothes, hair, expression, what they seem "
-              "to be doing. No intro, just the description.")
+    # Wave6-P4 (2026-05-29): richer prompt covers hands + desk items so the
+    # brain can answer "我手上拿什麼" / "桌上有什麼" from cached scene desc
+    # without dispatching an extra VL tool_call round-trip every turn. The
+    # explicit "no person visible" fallback keeps downstream prompt-stuffing
+    # short when the room is empty.
+    PROMPT = ("Describe the person in the frame: their clothing, facial "
+              "expression, any objects they are holding in their hands, and "
+              "items on the desk in front of them. Be concise and concrete. "
+              "If nothing visible, say \"no person visible\".")
     while not stop_event.is_set():
         obs.pulse("vision_worker")
         time.sleep(VISION_INTERVAL)
@@ -521,7 +527,9 @@ def vision_worker(stop_event: threading.Event):
                 continue
             img_b64 = _b64.b64encode(jpg.tobytes()).decode("ascii")
             t0 = time.perf_counter()
-            desc = _ask_vision(PROMPT, img_b64, num_predict=60,
+            # num_predict bumped 60→120 to fit the richer 4-part prompt
+            # (clothes / expression / hands / desk) without truncation.
+            desc = _ask_vision(PROMPT, img_b64, num_predict=120,
                                temperature=0.3, timeout=40)
             # H-O4 fix: pulse AGAIN right after the slow VL HTTP call returns
             # so a long (30-60 s) but successful inference doesn't leave the
@@ -2226,7 +2234,36 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
                     args = {}
                 if name:
                     try:
+                        _tool_t0 = time.perf_counter()
                         result = _exec_tool(name, args if isinstance(args, dict) else {})
+                        # Wave6-P4: query_vision observability (structured log
+                        # + Prom counter). Outcome bucket is inferred from the
+                        # result dict so we count timeouts separately from
+                        # generic errors. Cheap (no extra HTTP).
+                        if name == "query_vision":
+                            _tool_dur_ms = (time.perf_counter() - _tool_t0) * 1000
+                            _r = result if isinstance(result, dict) else {}
+                            if "answer" in _r:
+                                _outcome = "success"
+                            elif "error" in _r:
+                                _err = str(_r.get("error", "")).lower()
+                                _outcome = "timeout" if "timeout" in _err else "error"
+                            else:
+                                _outcome = "error"
+                            try:
+                                obs.vision_tool_call_total.labels(result=_outcome).inc()
+                            except Exception:
+                                pass
+                            try:
+                                logger.info(
+                                    "query_vision_called",
+                                    question=str(args.get("question", ""))[:200] if isinstance(args, dict) else "",
+                                    latency_ms=round(_tool_dur_ms, 1),
+                                    response_chars=len(str(_r.get("answer", ""))),
+                                    outcome=_outcome,
+                                )
+                            except Exception:
+                                pass
                         print(f"  [stream 工具] {name}({args}) → {str(result)[:120]}")
                         # Streaming path is one-shot (no second LLM round), so
                         # tool results carrying natural-language fields (vision
