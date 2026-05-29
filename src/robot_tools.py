@@ -23,13 +23,22 @@ DAEMON_BASE = f"http://{REACHY_HOST}:8000"
 # Vision model defaults — resolved per-call via _vision_endpoint() below so env
 # changes at runtime take effect. Module-level constants kept only as the
 # documented-default source; tests may monkey-patch them and will still win.
-VISION_OLLAMA_URL = _os.getenv("OLLAMA_HOST", "http://localhost:11434")
+VISION_OLLAMA_URL = _os.getenv("VISION_URL", _os.getenv("OLLAMA_HOST", "http://localhost:11434"))
 VISION_MODEL      = _os.getenv("VISION_MODEL", "qwen3.6:35b-a3b")
 
 def _vision_endpoint() -> tuple[str, str]:
-    """Return (base_url, model) honouring runtime env + any test monkey-patch."""
+    """Return (base_url, model) honouring runtime env + any test monkey-patch.
+
+    Resolution order for URL: VISION_URL > OLLAMA_HOST > module global > default.
+    VISION_URL is preferred for the Moondream2 OpenAI-compat backend on
+    vllm0528:8002; OLLAMA_HOST remains for back-compat with Ollama deployments.
+    """
     g = globals()
-    url   = _os.getenv("OLLAMA_HOST", g.get("VISION_OLLAMA_URL", "http://localhost:11434"))
+    url = (
+        _os.getenv("VISION_URL")
+        or _os.getenv("OLLAMA_HOST")
+        or g.get("VISION_OLLAMA_URL", "http://localhost:11434")
+    )
     model = _os.getenv("VISION_MODEL", g.get("VISION_MODEL", "qwen3.6:35b-a3b"))
     return url, model
 
@@ -60,28 +69,43 @@ def _get_frame_b64() -> str | None:
 
 def _ask_vision(prompt: str, b64_img: str, num_predict: int = 200,
                 temperature: float = 0.2, timeout: float = 30) -> str:
-    """Send an image + text prompt to the Qwen3.6 VL endpoint. Returns raw content
-    string (may contain markdown fence, etc.)."""
+    """Send an image + text prompt to the VL endpoint. Returns raw content string.
+
+    Uses the OpenAI-compatible chat completions shape, which is served by the
+    Moondream2 wrapper on vllm0528:8002 as well as upstream vLLM / OpenAI / any
+    OpenAI-spec gateway. If the resolved URL already includes a path (e.g.
+    ``http://host:8002/v1/chat/completions``) it is used verbatim, otherwise
+    ``/v1/chat/completions`` is appended.
+
+    The Moondream2 wrapper ignores ``temperature`` and treats ``max_tokens`` as
+    ``max_new_tokens``; both fields are still sent for forward-compat with
+    other backends.
+    """
     url, model = _vision_endpoint()
+    endpoint = url if "/chat/completions" in url else f"{url.rstrip('/')}/v1/chat/completions"
     payload = {
         "model": model,
-        "stream": False,
-        "think": False,   # critical — qwen3.6 thinking eats num_predict otherwise
-        "keep_alive": "30m",
-        "options": {"num_ctx": 2048, "num_predict": num_predict, "temperature": temperature},
+        "max_tokens": num_predict,
+        "temperature": temperature,
         "messages": [{
             "role": "user",
-            "content": prompt,
-            "images": [b64_img],
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
+            ],
         }],
     }
     req = _urlreq.Request(
-        f"{url}/api/chat",
+        endpoint,
         data=_json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
     with _urlreq.urlopen(req, timeout=timeout) as resp:
         data = _json.loads(resp.read().decode("utf-8"))
+    choices = data.get("choices") or []
+    if choices:
+        return (choices[0].get("message", {}).get("content") or "").strip()
+    # Tolerate Ollama-shape responses if a legacy backend is targeted.
     return (data.get("message", {}).get("content") or "").strip()
 
 
