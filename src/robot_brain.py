@@ -1796,6 +1796,56 @@ def _ask_via_ollama(text: str) -> dict:
         _llm_dialog_active.clear()
 
 
+# Wave6-P4 (2026-05-29) — query_vision tool-call instrumentation. Used by BOTH
+# the streaming dispatcher (~2237) and the non-streaming tool loop in
+# _ask_via_ollama_inner (~1847). Keeping observability in one helper means we
+# can't silently regress one path. Cheap (no extra HTTP), never raises.
+def _instrumented_exec_tool(name: str, args: dict):
+    """Run a tool via robot_tools.execute_tool with query_vision observability.
+
+    For query_vision specifically, emits:
+      - prometheus counter brain_vision_tool_call_total{result=success|error|timeout|no_frame}
+      - structlog event query_vision_called{question, latency_ms, response_chars, outcome}
+    Other tools pass through with no extra overhead.
+    """
+    from robot_tools import execute_tool as _exec_tool
+    if name != "query_vision":
+        return _exec_tool(name, args if isinstance(args, dict) else {})
+    _t0 = time.perf_counter()
+    result = _exec_tool(name, args if isinstance(args, dict) else {})
+    _dur_ms = (time.perf_counter() - _t0) * 1000
+    _r = result if isinstance(result, dict) else {}
+    if "answer" in _r:
+        # canned no-frame answer flagged separately so dashboards can distinguish
+        # "VLM said something" from "we never reached the VLM at all"
+        ans = str(_r.get("answer", ""))
+        if "camera isn't ready" in ans.lower() or "can't see anything" in ans.lower():
+            _outcome = "no_frame"
+        else:
+            _outcome = "success"
+    elif "error" in _r:
+        _err = str(_r.get("error", "")).lower()
+        # M2 fix: socket.timeout etc. surface as "timed out" not "timeout"
+        _outcome = "timeout" if any(t in _err for t in ("timeout", "timed out")) else "error"
+    else:
+        _outcome = "error"
+    try:
+        obs.vision_tool_call_total.labels(result=_outcome).inc()
+    except Exception:
+        pass
+    try:
+        logger.info(
+            "query_vision_called",
+            question=str(args.get("question", ""))[:200] if isinstance(args, dict) else "",
+            latency_ms=round(_dur_ms, 1),
+            response_chars=len(str(_r.get("answer", ""))),
+            outcome=_outcome,
+        )
+    except Exception:
+        pass
+    return result
+
+
 def _ask_via_ollama_inner(text: str) -> dict:
     t0 = time.perf_counter()
     messages = [
@@ -1845,7 +1895,9 @@ def _ask_via_ollama_inner(text: str) -> dict:
             # Append assistant turn (with tool_calls preserved) + tool results
             messages.append(msg)
             for c in calls:
-                result = execute_tool(c["name"], c["arguments"])
+                # Wave6-P4: go via _instrumented_exec_tool so query_vision counter
+                # + structlog fire on the non-streaming fallback path too.
+                result = _instrumented_exec_tool(c["name"], c["arguments"])
                 print(f"    ↳ {c['name']}({c['arguments']}) → {str(result)[:120]}")
                 messages.append({
                     "role": "tool",
@@ -2223,7 +2275,6 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
     # right" verbally but tool_call gets silently dropped.
     if tool_call_acc:
         try:
-            from robot_tools import execute_tool as _exec_tool
             calls_in_order = [tool_call_acc[i] for i in sorted(tool_call_acc.keys())]
             for tc in calls_in_order:
                 name = tc["function"].get("name", "")
@@ -2234,36 +2285,10 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
                     args = {}
                 if name:
                     try:
-                        _tool_t0 = time.perf_counter()
-                        result = _exec_tool(name, args if isinstance(args, dict) else {})
-                        # Wave6-P4: query_vision observability (structured log
-                        # + Prom counter). Outcome bucket is inferred from the
-                        # result dict so we count timeouts separately from
-                        # generic errors. Cheap (no extra HTTP).
-                        if name == "query_vision":
-                            _tool_dur_ms = (time.perf_counter() - _tool_t0) * 1000
-                            _r = result if isinstance(result, dict) else {}
-                            if "answer" in _r:
-                                _outcome = "success"
-                            elif "error" in _r:
-                                _err = str(_r.get("error", "")).lower()
-                                _outcome = "timeout" if "timeout" in _err else "error"
-                            else:
-                                _outcome = "error"
-                            try:
-                                obs.vision_tool_call_total.labels(result=_outcome).inc()
-                            except Exception:
-                                pass
-                            try:
-                                logger.info(
-                                    "query_vision_called",
-                                    question=str(args.get("question", ""))[:200] if isinstance(args, dict) else "",
-                                    latency_ms=round(_tool_dur_ms, 1),
-                                    response_chars=len(str(_r.get("answer", ""))),
-                                    outcome=_outcome,
-                                )
-                            except Exception:
-                                pass
+                        # Wave6-P4: instrumented wrapper handles query_vision
+                        # Prom counter + structlog event; pass-through for others.
+                        # Shared with non-streaming path (_ask_via_ollama_inner).
+                        result = _instrumented_exec_tool(name, args if isinstance(args, dict) else {})
                         print(f"  [stream 工具] {name}({args}) → {str(result)[:120]}")
                         # Streaming path is one-shot (no second LLM round), so
                         # tool results carrying natural-language fields (vision

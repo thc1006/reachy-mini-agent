@@ -131,3 +131,85 @@ def test_query_vision_vlm_exception_returns_error(monkeypatch):
     out = rt.execute_tool("query_vision", {"question": "is there a cat?"})
     assert "error" in out
     assert "timeout" in out["error"].lower() or "timeouterror" in out["error"].lower()
+
+
+# ───────────────────────── Wave6-P4 YELLOW fix-loop tests ────────────────────
+
+def test_get_frame_b64_rejects_stale_frame(monkeypatch):
+    """M1 fix: `_get_frame_b64()` must mirror vision_worker's recency guard.
+    A frame older than _STALE_FRAME_MAX_AGE_S (2 s) → None so the caller falls
+    back to the canned "no view" answer instead of feeding a stale image to
+    the VLM and reporting a confidently-wrong answer."""
+    import time
+    import sys
+    import types
+    import robot_tools as rt
+
+    # Build a minimal fake robot_brain module that exposes _latest_frame +
+    # _latest_frame_t. This works whether or not robot_brain is importable in
+    # the test env (it requires a heavy cv2 backend on Pi).
+    fake_brain = types.ModuleType("robot_brain")
+    fake_brain._latest_frame = object()  # truthy placeholder; cv2.imencode is mocked below
+    fake_brain._latest_frame_t = time.time() - 5.0  # 5 s old → stale
+    monkeypatch.setitem(sys.modules, "robot_brain", fake_brain)
+
+    # Ensure cv2.imencode is NOT reached when the frame is rejected.
+    import cv2  # cv2-headless is a test dep
+    def boom_imencode(*a, **kw):
+        raise AssertionError("cv2.imencode must NOT run for a stale frame")
+    monkeypatch.setattr(cv2, "imencode", boom_imencode)
+
+    assert rt._get_frame_b64() is None, "stale frame (>2s) must return None"
+
+    # Sanity: a fresh frame (within window) is NOT rejected by the recency
+    # check — imencode should be called and yield a base64 string.
+    fake_brain._latest_frame_t = time.time()
+    class _FakeJpg:
+        def tobytes(self):
+            return b"\xff\xd8\xff"  # 3-byte JPEG magic
+    def fake_imencode(*a, **kw):
+        return True, _FakeJpg()
+    monkeypatch.setattr(cv2, "imencode", fake_imencode)
+    out = rt._get_frame_b64()
+    assert out is not None, "fresh frame should pass recency guard"
+    assert isinstance(out, str)
+
+
+def test_outcome_label_timeout_for_timed_out_message(monkeypatch):
+    """M2 fix: brain `_instrumented_exec_tool` outcome classifier must label
+    socket.timeout / urlopen-style 'timed out' errors as outcome='timeout'
+    (not 'error'). Without this, real production timeouts get bucketed as
+    generic errors and the timeout SLO dashboard misses them."""
+    import sys
+    import importlib
+
+    # robot_brain has heavy import-time side effects on Pi; skip if it can't
+    # be loaded in the test env.
+    rb = pytest.importorskip("robot_brain")
+
+    # Patch the underlying execute_tool to return a 'timed out' error (the
+    # exact substring socket / urllib surface, NOT 'timeout').
+    import robot_tools as rt
+    def fake_exec(name, args):
+        return {"error": "vision call failed: timeout: The read operation timed out"}
+    monkeypatch.setattr(rt, "execute_tool", fake_exec)
+
+    # Mute structlog to avoid test-env noise; the Prom counter is what matters.
+    calls = {"labels": [], "inc": 0}
+    class _FakeMetric:
+        def labels(self, **kw):
+            calls["labels"].append(kw)
+            class _Inc:
+                def inc(self_inner):
+                    calls["inc"] += 1
+            return _Inc()
+    monkeypatch.setattr(rb.obs, "vision_tool_call_total", _FakeMetric())
+
+    rb._instrumented_exec_tool("query_vision", {"question": "anything?"})
+
+    assert calls["inc"] == 1, "counter must increment exactly once"
+    assert calls["labels"], "labels() must have been called"
+    assert calls["labels"][0].get("result") == "timeout", (
+        f"'timed out' substring should map to result='timeout', "
+        f"got {calls['labels'][0]}"
+    )

@@ -47,16 +47,31 @@ def _vision_endpoint() -> tuple[str, str]:
 # robot_brain.py sets `_latest_frame` as a cv2 BGR ndarray. We avoid importing
 # robot_brain here (heavy); instead each tool calls `_get_frame_b64()` which
 # the brain can monkey-patch at startup. Default: try to import cv2 + brain lazily.
+_STALE_FRAME_MAX_AGE_S = 2.0  # caller gets None → canned "no view" fallback
+
+
 def _get_frame_b64() -> str | None:
-    """Return current camera frame as base64 JPEG, or None if unavailable."""
+    """Return current camera frame as base64 JPEG, or None if unavailable.
+
+    Also returns None if the latest frame is older than ``_STALE_FRAME_MAX_AGE_S``
+    (default 2.0 s). Mirrors the vision_worker recency guard in robot_brain
+    (1.0 s there) — query_vision gets a slightly longer grace window since the
+    LLM took some time to decide to call the tool, but a 2-second-old frame is
+    the cap before we treat the camera as effectively offline.
+    """
     try:
         import cv2
+        import time as _time
         try:
             import robot_brain as _rb
         except ImportError:
             return None
         frame = getattr(_rb, "_latest_frame", None)
         if frame is None:
+            return None
+        last_t = getattr(_rb, "_latest_frame_t", 0.0) or 0.0
+        # last_t == 0 means brain hasn't started camera worker yet → treat as stale
+        if last_t <= 0 or (_time.time() - last_t) > _STALE_FRAME_MAX_AGE_S:
             return None
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ok:
@@ -688,10 +703,13 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
     # ── vision tools (Qwen3.6 native VL: MMMU 81.7, RefCOCO 92) ──────────────
     "see_what": (
         _spec("see_what",
-              "Look through the robot's camera and describe what is currently visible. "
-              "Use this when the user asks 'what do you see', 'what's in front of you', "
-              "or wants a general visual update. Optional query narrows focus.",
-              {"query": {"type": "string", "description": "Optional focused question about the scene (e.g. 'what color is the mug')."}}),
+              "Look through the robot's camera and give a 1-2 sentence ambient description "
+              "of what is currently visible (people, surroundings, mood). Use this for "
+              "general/open-ended 'what do you see' or 'what's in front of you' updates. "
+              "For a SPECIFIC factual question (counting, identifying held objects, reading "
+              "text, precise spatial checks) use query_vision instead — it forces a fresh "
+              "focused inference. Optional query narrows the caption topic only.",
+              {"query": {"type": "string", "description": "Optional topic to bias the ambient caption (e.g. 'focus on people'). For specific factual questions, use query_vision instead."}}),
         _tool_see_what,
     ),
     "find_in_view": (
@@ -716,12 +734,16 @@ TOOLS: dict[str, tuple[dict, Callable[..., dict]]] = {
     # specific that the periodic LATEST_SCENE_DESC may not cover.
     "query_vision": (
         _spec("query_vision",
-              "Ask the vision model a specific question about what is currently visible "
-              "(e.g. 'what is the user holding in their right hand?', 'what color is the "
-              "person's shirt?', 'is the cup on the table?'). Use this when the user asks "
-              "about something specific in the visual scene that the periodic scene "
-              "description may not cover. Returns the VLM's answer as a string.",
-              {"question": {"type": "string", "description": "The specific question to ask the vision model about the current view."}},
+              "Ask the vision model a SPECIFIC factual question requiring a FRESH on-demand "
+              "inference about the current view — counting items, identifying objects "
+              "currently held in someone's hand, reading visible text/labels, verifying a "
+              "precise spatial relation (e.g. 'how many fingers am I holding up', 'what is "
+              "the user holding in their right hand', 'what does the label on the bottle "
+              "say', 'is the red cup to the left of the laptop'). Use this when accuracy "
+              "matters NOW and the periodic cached scene description may be stale or too "
+              "generic. For an ambient/general 'what do you see' update, prefer see_what "
+              "instead. Returns {answer: string}.",
+              {"question": {"type": "string", "description": "The specific factual question to ask the vision model about the current view."}},
               required=["question"]),
         _tool_query_vision,
     ),
