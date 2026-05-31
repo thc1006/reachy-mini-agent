@@ -49,10 +49,12 @@ cp .env.example .env
 # 5. Run the three services (in three terminals, or via systemd units in systemd/)
 python src/whisper_server.py    # port 8881
 python src/kokoro_server.py     # port 8880 (skip if TTS_ENGINE=edge)
-scripts/run_robot.sh            # the main brain
+python -m robot_brain           # the main brain (dev mode; production uses
+                                # `systemctl --user start reachy-brain.service`
+                                # — see docs/architecture/brain-on-pi-2026-05-29.md)
 ```
 
-Hardware, network layout, and systemd setup — see [docs/HARDWARE.md](docs/HARDWARE.md) and [docs/SETUP.md](docs/SETUP.md).
+Hardware, network layout, and systemd setup — see [docs/HARDWARE.md](docs/HARDWARE.md), [docs/SETUP.md](docs/SETUP.md), and [docs/architecture/brain-on-pi-2026-05-29.md](docs/architecture/brain-on-pi-2026-05-29.md).
 
 ---
 

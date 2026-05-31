@@ -62,7 +62,7 @@ Verify: `gst-inspect-1.0 webrtcsrc` should print a "Factory Details" block.
 
 ## CUDA / cuDNN
 
-`faster-whisper` and `kokoro-onnx` both need cuDNN 9. The Python wheels ship their own cuDNN but the loader can't find it by default. `scripts/run_robot.sh` prepends the wheel's lib dirs to `LD_LIBRARY_PATH`:
+`faster-whisper` and `kokoro-onnx` both need cuDNN 9. The Python wheels ship their own cuDNN but the loader can't find it by default. Brain launch scripts (e.g. `scripts/run_robot_vllm.sh`) prepend the wheel's lib dirs to `LD_LIBRARY_PATH`:
 
 ```bash
 SP="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"

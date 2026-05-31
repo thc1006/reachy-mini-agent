@@ -31,8 +31,8 @@ All notable changes to this project will be documented here. Format based on [Ke
   timeouts during active dialog).
 - New optional-dependency groups: `memory` (mem0ai, qdrant-client,
   ollama) and `dev` (huggingface-hub[cli], pytest, pandas, matplotlib).
-- New env knobs in `scripts/run_robot.sh`: `VISION_MODEL`,
-  `OLLAMA_THINK`, `LLM_STREAMING`, `LLM_TOOLS`.
+- New env knobs in `/home/pollen/brain/.env` on Pi (see `.env.example`):
+  `VISION_MODEL`, `OLLAMA_THINK`, `LLM_STREAMING`, `LLM_TOOLS`.
 
 ### Changed
 - TTS playback pad increased from 0.3 s to 1.2 s so the WebRTC +

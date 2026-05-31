@@ -1,15 +1,57 @@
 [Unit]
-Description=Reachy Mini Agent — main brain (vision + voice + LLM)
-After=network-online.target kokoro.service whisper.service
+# Mirrors the production unit on Reachy Mini Pi (~/.config/systemd/user/reachy-brain.service).
+# See docs/architecture/brain-on-pi-2026-05-29.md for the full Pi-side setup.
+# Copy to ~/.config/systemd/user/reachy-brain.service, edit paths if your layout
+# differs, then `systemctl --user daemon-reload && systemctl --user enable --now reachy-brain.service`.
+Description=Reachy Mini Robot Brain (on-Pi orchestration, vllm0528 backends)
+After=reachy-mini-daemon.service network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Type=simple
-WorkingDirectory=%h/reachy-mini-agent
-ExecStart=%h/reachy-mini-agent/scripts/run_robot.sh
+Type=notify
+WatchdogSec=120
+TimeoutStartSec=180
+
+WorkingDirectory=/home/pollen/brain
+EnvironmentFile=/home/pollen/brain/.env
+
+# Memory + thread footprint optimizations (Pi 4 4GB; per 2026-05-29 P0 analysis)
+Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=PYTHONPATH=/home/pollen/brain/src
+
+ExecStart=/home/pollen/brain-venv/bin/python -m robot_brain
+
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:%h/reachy-mini-agent/logs/robot_brain.log
+
+# Memory cap: brain peaked at 432MB in P4 dry-run; 1800MB ceiling gives 4x
+# headroom but triggers cgroup OOM kill if brain leaks. OOMPolicy=kill marks
+# unit failed -> Restart=on-failure fires.
+MemoryMax=1800M
+OOMPolicy=kill
+
+# 2026-05-29 P5+P9+P10 hardening batch (Pi systemd QoS)
+# AllowedCPUs/IOWeight require cpuset+io delegation added via
+# /etc/systemd/system/user@1000.service.d/10-delegate-cpuset-io.conf
+CPUWeight=200
+CPUQuota=200%
+AllowedCPUs=2,3
+IOWeight=200
+Nice=-5
+OOMScoreAdjust=-500
+
+# KillMode=control-group (default) sends SIGTERM to all PIDs in cgroup -
+# critical because brain spawns threads (HandLandmarker, tracking_loop,
+# vision_loop, motion workers). Don't override.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+StandardOutput=append:/home/pollen/brain/logs/robot_brain.log
 StandardError=inherit
 
 [Install]

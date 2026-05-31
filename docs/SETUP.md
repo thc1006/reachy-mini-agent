@@ -51,11 +51,17 @@ Key values to set:
 ## 4. Smoke-test services individually
 
 ```bash
-# In three terminals:
+# In three terminals (dev mode):
 .venv/bin/python src/whisper_server.py
 .venv/bin/python src/kokoro_server.py    # only if TTS_ENGINE=kokoro
-scripts/run_robot.sh
+.venv/bin/python -m robot_brain
 ```
+
+For production, the brain runs as a systemd user unit on the Pi
+(`systemctl --user start reachy-brain.service`). See
+[docs/architecture/brain-on-pi-2026-05-29.md](architecture/brain-on-pi-2026-05-29.md)
+for the full Pi-side layout and `systemd/robot-brain.service.example` for a
+committable reference mirroring the production unit.
 
 You should hear: _"System online! I'll say hi to anyone who comes by!"_ from the robot within ~20 seconds. Walk in front of the camera — the head should track and a greeting should play.
 

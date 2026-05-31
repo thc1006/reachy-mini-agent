@@ -1,7 +1,9 @@
 #!/bin/bash
 # robot_brain launcher · s1 2× RTX 3090 · vLLM TP=2 unified backend
-# Drop-in replacement for run_robot.sh that flips LLM_BACKEND=vllm
+# Standalone dev launcher that pins LLM_BACKEND=vllm
 # (continuous batching, no vision/dialog contention).
+# Production on Pi runs via `systemctl --user start reachy-brain.service`
+# — see docs/architecture/brain-on-pi-2026-05-29.md.
 set -eu
 
 cd "$HOME/dev/reachy-agent/robot"
@@ -20,7 +22,7 @@ export REACHY_HOST=${REACHY_HOST:-100.85.191.3}
 # When LLM_BACKEND=vllm, every chat / vision / streaming call routes to the
 # vLLM endpoint instead of Ollama (continuous batching = no contention).
 export LLM_BACKEND=vllm
-# See run_robot.sh for migration history (s1 → vllm0528, 2026-05-28).
+# See CHANGELOG.md / docs/architecture/ for migration history (s1 → vllm0528, 2026-05-28).
 export VLLM_HOST=${VLLM_HOST:-vllm0528}
 export VLLM_PORT=${VLLM_PORT:-8000}
 export VLLM_MODEL=${VLLM_MODEL:-qwen36-awq}
