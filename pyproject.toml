@@ -83,7 +83,7 @@ exclude = ["reachy-mini-intent-runtime/**"]
 [tool.pytest.ini_options]
 # Prevent pytest auto-discovery from recursing into self-contained sub-projects
 # that have their own venv + test suite.
-norecursedirs = ["reachy-mini-intent-runtime", ".venv", "venv", "build", "dist"]
+norecursedirs = ["reachy-mini-intent-runtime", ".venv", "venv", "build", "dist", "archive"]
 
 [tool.ruff]
 line-length = 99
