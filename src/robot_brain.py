@@ -109,7 +109,18 @@ HOST             = os.getenv("REACHY_HOST", "reachy-mini.local")   # mDNS by def
 SAMPLE_RATE      = 16000
 # 排線修好後切到機器人自己的 mic；PC mic 當 fallback
 USE_ROBOT_MIC    = True     # True = robot mic via WebRTC / False = PC pyaudio
-SILENCE_THRESHOLD = 0.0022 if USE_ROBOT_MIC else 0.0012  # robot mic 靈敏度（0.0022：底噪 ~0.0012 之上）
+# 2026-06-01 實測（7 段真實 mic wav）：robot mic 噪音地板 RMS −52~−56 dBFS
+# (norm ≤0.0025)、真語音 −27~−33 dBFS (norm ≥0.022)。舊值 0.0022 (−53 dBFS)
+# 落在噪音地板「裡面」→ 雜訊 spike 就 latch has_speech → 送純噪音給 Breeze →
+# 回空字 → do_conversation `if not text: continue` 吞掉 → 使用者體感「不理我」。
+# 5/22 換 Breeze 前 large-v3-turbo 會對噪音幻覺出文字掩蓋此缺陷。
+# 新值 0.0079 (−42 dBFS) = 比最差噪音高 10 dB、比最弱語音低 9 dB。env 可覆寫調校。
+SILENCE_THRESHOLD = float(os.getenv(
+    "SILENCE_THRESHOLD",
+    "0.0079" if USE_ROBOT_MIC else "0.0040",
+))
+# 最短累積語音秒數：擋單一雜訊 spike latch 整段（大多是靜音）buffer 進 STT。
+MIN_VOICED_S = float(os.getenv("MIN_VOICED_S", "0.30"))
 SILENCE_DURATION  = 1.4     # 靜音幾秒停止錄音（給說話中短停頓一點緩衝）
 CHUNK_SAMPLES    = 1600     # 100ms @ 16kHz（PC mic 用）
 
@@ -1350,6 +1361,7 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
 
     chunks = []
     silent_s   = 0.0
+    voiced_s   = 0.0   # 累積「真的超過門檻」的秒數、用來擋單一雜訊 spike
     has_speech = False
     t_start    = time.time()
     print(f"  [聆聽 robot] ", end="", flush=True)
@@ -1370,6 +1382,7 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
             if not has_speech:
                 elder_care.fire_antenna_cue(mini, "listening", motion_lock=_motion_lock)
             has_speech = True
+            voiced_s += len(mono) / SAMPLE_RATE
             silent_s = 0.0
             print("▪", end="", flush=True)
         else:
@@ -1380,7 +1393,12 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
     # P8 — return antennas to neutral once we stop listening, regardless of
     # whether speech was captured (cue must not leave the antennas tilted).
     elder_care.fire_antenna_cue(mini, "neutral", motion_lock=_motion_lock)
-    return np.concatenate(chunks) if has_speech else None
+    # Min-voiced gate (2026-06-01)：一個 ~50ms 雜訊 spike 會 latch has_speech、
+    # 把整段大多是靜音的 buffer 送 STT → Breeze 正確回空 → 體感「不理我」。
+    # 要求至少 MIN_VOICED_S 的累積語音才接受這一輪、否則當作沒人講話。
+    if not has_speech or voiced_s < MIN_VOICED_S:
+        return None
+    return np.concatenate(chunks)
 
 def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
     _wait_not_speaking()
@@ -1388,6 +1406,7 @@ def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
     stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=SAMPLE_RATE,
                      input=True, frames_per_buffer=CHUNK_SAMPLES)
     chunks, silent_chunks, has_speech = [], 0, False
+    voiced_s = 0.0   # 累積真語音秒數、min-voiced gate 用
     max_silent  = int(SILENCE_DURATION * SAMPLE_RATE / CHUNK_SAMPLES)
     max_timeout = int(timeout * SAMPLE_RATE / CHUNK_SAMPLES)
 
@@ -1400,6 +1419,7 @@ def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
             energy = float(np.sqrt(np.mean(mono ** 2)))
             if energy > SILENCE_THRESHOLD:
                 has_speech = True
+                voiced_s += len(mono) / SAMPLE_RATE
                 silent_chunks = 0
                 print("▪", end="", flush=True)
             else:
@@ -1411,7 +1431,10 @@ def _record_via_pc_mic(timeout: float) -> np.ndarray | None:
     finally:
         stream.stop_stream(); stream.close(); pa.terminate()
     print()
-    return np.concatenate(chunks) if has_speech else None
+    # Min-voiced gate — 見 _record_via_robot_mic 同名邏輯
+    if not has_speech or voiced_s < MIN_VOICED_S:
+        return None
+    return np.concatenate(chunks)
 
 def record_utterance(mini, timeout: float = CONVO_TIMEOUT) -> np.ndarray | None:
     if USE_ROBOT_MIC:
@@ -2766,6 +2789,13 @@ def tracking_loop(mini, stop_event: threading.Event):
     LOST_CONN_LIMIT = 3
     lost_conn_count = 0
 
+    # Frame-stall watchdog (2026-06-01)：WebRTC video plane 凍結時 get_frame()
+    # 持續回 None 但「不丟 exception」→ tracking_loop 空轉、上面的 Lost-connection
+    # 計數器（只管 WebSocket 控制面）永遠救不了。連續 None 超過 NO_FRAME_LIMIT_S
+    # 就 exit、沿用 Lost-connection 同一條 SystemExit→systemd 乾淨重連路徑。
+    NO_FRAME_LIMIT_S = float(os.getenv("BRAIN_NO_FRAME_LIMIT_S", "20"))
+    _last_good_frame_t = time.time()
+
     # Sync face_tracker baseline from daemon's real pose at startup. Without
     # this, _last_cmd_pitch/yaw are 0.0 by default while the daemon's actual
     # pose may be anywhere (e.g. user just moved head via /api/move/goto,
@@ -2807,8 +2837,20 @@ def tracking_loop(mini, stop_event: threading.Event):
         # ── 取得影像 ───────────────────────────────────────────────────────
         frame = mini.media.get_frame()
         if frame is None:
+            stalled = time.time() - _last_good_frame_t
+            if stalled > NO_FRAME_LIMIT_S:
+                print(f"  [追蹤] video 凍結 {stalled:.0f}s (get_frame 連續 None) — "
+                      "exit 讓 systemd 重啟、重連 WebRTC", flush=True)
+                try:
+                    logger.error("video_frame_stall_restart",
+                                 stall_s=round(stalled, 1))
+                except Exception:
+                    pass
+                stop_event.set()
+                raise SystemExit(3)
             time.sleep(0.05)
             continue
+        _last_good_frame_t = time.time()   # 拿到真 frame → reset stall timer
 
         h, w = frame.shape[:2]
 
@@ -3020,7 +3062,11 @@ def tracking_loop(mini, stop_event: threading.Event):
         _latest_frame = frame
         _latest_frame_t = time.time()
 
-        time.sleep(0.02)   # 50ms→20ms 追蹤 ~50 FPS（原本 20 FPS）
+        # 2026-06-01：50ms→20ms (50 FPS) 的改動把 cv2.resize+YuNet detect 的
+        # per-frame 配置率 ×2.5 → aarch64 glibc arena 碎裂 → 記憶體 ~80 MB/min
+        # (歷史 40-50 的 2 倍) → 每 13-18 分撞 watchdog 重啟。回退 20 FPS、臉部
+        # 追蹤對長者照護情境已足夠平順。env 可覆寫微調。
+        time.sleep(float(os.getenv("TRACK_LOOP_SLEEP_S", "0.05")))   # ~20 FPS
 
     print("  [追蹤] 結束")
 
