@@ -147,11 +147,19 @@ async def health():
 
 @app.post("/v1/audio/speech")
 async def speech(req: SpeechRequest):
+    # H2 (CosyVoice review): the readiness check must run BEFORE we touch
+    # app.state.lock. Lifespan sets `ready=True` LAST (after CosyVoice2 ctor
+    # + lock allocation), so during cold start a request that hits the
+    # handler before lifespan completes could grab the lock and stall the
+    # event loop while the model is still loading. Hoist the 503 check to
+    # the very top of the handler so callers fail fast and the breaker on
+    # the brain side trips cleanly during a vllm0528 supervisord restart.
+    if not getattr(app.state, "ready", False):
+        raise HTTPException(status_code=503, detail="model not ready")
+
     text = (req.input or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty input")
-    if not getattr(app.state, "ready", False):
-        raise HTTPException(status_code=503, detail="model not ready")
 
     speed = float(req.speed or 1.0)
     if speed < 0.5 or speed > 2.0:
@@ -163,28 +171,53 @@ async def speech(req: SpeechRequest):
     sr = app.state.sample_rate
     lock: asyncio.Lock = app.state.lock
 
-    # Decide inference path:
-    #   default (cn-style prompt) → if synthesis text is ascii-heavy (en/ja/ko
-    #   characters present in CosyVoice2 vocab), cross_lingual usually sounds
-    #   better than zero_shot with mismatched prompt language.
-    lang_hint = (req.language or "auto").lower()
-    use_cross_lingual = lang_hint in ("en", "ja", "ko") or (
-        lang_hint == "auto" and _is_mostly_non_chinese(text)
-    )
+    # M2 (CosyVoice review): language routing is owned by the BRAIN side
+    # (_detect_tts_language in src/robot_brain.py classifies via Unicode
+    # script counting then forwards "zh"|"en"|"ja"|"ko"). The server only
+    # needs to trust that hint — the prior `_is_mostly_non_chinese` heuristic
+    # was dead code because the brain never sends "auto", and keeping two
+    # diverging classifiers (different thresholds: brain >0 han chars = zh,
+    # server <30% han = non-chinese) made the routing impossible to reason
+    # about. Trust the hint; default to zero_shot when the hint is missing
+    # or unknown — the cn-prompt zero-shot path is the safest default.
+    lang_hint = (req.language or "").lower().strip()
+    use_cross_lingual = lang_hint in ("en", "ja", "ko")
 
     t0 = time.perf_counter()
-    # Run blocking inference in a worker thread; serialize via lock since the
-    # CosyVoice2 generator and onnxruntime sessions are not thread-safe.
-    async with lock:
-        chunks = await asyncio.to_thread(
-            _run_inference, cosy, text, prompt_text, prompt_wav, speed, use_cross_lingual
+    try:
+        wav_bytes, dur_s = await _serialized_inference(
+            lock, cosy, text, prompt_text, prompt_wav, speed,
+            use_cross_lingual, sr,
         )
-    if not chunks:
-        raise HTTPException(status_code=500, detail="no audio produced")
+    except torch.cuda.OutOfMemoryError as e:
+        # M1 (CosyVoice review): split CUDA OOM from generic inference
+        # failure so the brain breaker + dashboards can split GPU-pressure
+        # events (transient, retriable after backoff) from genuine bugs.
+        # empty_cache() releases cached blocks back to the CUDA allocator —
+        # the next request may then succeed without a restart.
+        log.error("cuda_oom on synth chars=%d: %s", len(text), e)
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="cuda oom",
+            headers={"X-Error-Class": "cuda_oom"},
+        )
+    except HTTPException:
+        # Re-raise our own 4xx/5xx (e.g. "no audio produced") untouched —
+        # they already carry the right shape; only generic exceptions get
+        # the inference_failed wrapper below.
+        raise
+    except Exception as e:
+        log.exception("inference failed chars=%d: %s", len(text), e)
+        raise HTTPException(
+            status_code=500,
+            detail="inference failed",
+            headers={"X-Error-Class": "inference_failed"},
+        )
 
-    full = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
-    wav_bytes = _pcm_to_wav(full, sr)
-    dur_s = len(full) / sr
     elapsed = time.perf_counter() - t0
     log.info(
         "synth chars=%d audio=%.2fs gen=%.2fs rtf=%.3f mode=%s",
@@ -205,13 +238,31 @@ async def speech(req: SpeechRequest):
     )
 
 
-def _is_mostly_non_chinese(text: str) -> bool:
-    """Return True if >70% of non-space chars fall outside CJK Unified Ideographs."""
-    chars = [c for c in text if not c.isspace()]
-    if not chars:
-        return False
-    cjk = sum(1 for c in chars if "一" <= c <= "鿿")
-    return cjk / len(chars) < 0.30
+async def _serialized_inference(
+    lock: asyncio.Lock,
+    cosy,
+    text: str,
+    prompt_text: str,
+    prompt_wav,
+    speed: float,
+    cross_lingual: bool,
+    sr: int,
+) -> tuple[bytes, float]:
+    """Hold the per-process lock, run blocking inference in a worker thread,
+    and return ``(wav_bytes, duration_seconds)``.
+
+    Extracted from the handler so the invariant ("only one inference at a
+    time; the lock wraps both the CosyVoice2 generator AND the onnxruntime
+    sessions which are not thread-safe per upstream") lives in one place.
+    """
+    async with lock:
+        chunks = await asyncio.to_thread(
+            _run_inference, cosy, text, prompt_text, prompt_wav, speed, cross_lingual
+        )
+    if not chunks:
+        raise HTTPException(status_code=500, detail="no audio produced")
+    full = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+    return _pcm_to_wav(full, sr), len(full) / sr
 
 
 def _run_inference(cosy, text, prompt_text, prompt_wav, speed, cross_lingual):

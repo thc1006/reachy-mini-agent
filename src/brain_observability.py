@@ -470,12 +470,22 @@ except ImportError:
 
 _breakers: dict[str, object] = {}
 _breaker_lock = threading.Lock()
-# Hot-path cache: the three production backends are read every dialog turn —
+# Hot-path cache: the production backends are read every dialog turn —
 # fetching them through the lock on every call_with_breaker is wasted
 # contention. Populated lazily on first get_breaker() for these names; reads
 # of the cache are lock-free (dict.get is atomic for str keys in CPython).
-_KNOWN_BACKENDS = frozenset({"vllm", "whisper", "kokoro"})
+# 2026-06-01 (CosyVoice review M4): added "cosyvoice" so the new TTS backend
+# also takes the lock-free hot path on every speak() turn.
+_KNOWN_BACKENDS = frozenset({"vllm", "whisper", "kokoro", "cosyvoice"})
 _breaker_cache: dict[str, object] = {}
+
+# Per-backend default fail_max override. Most backends use the global
+# fail_max=5 (configured at call site). CosyVoice is self-hosted on vllm0528
+# with no warm capacity for a cold restart, so we open its circuit faster
+# (fail_max=2) and let edge-tts take over rather than burn ~8 s × 5 = 40 s
+# of degraded UX before the breaker trips. Read by callers that pass
+# `fail_max=_BACKEND_FAIL_MAX.get(name, 5)` to get_breaker().
+_BACKEND_FAIL_MAX: dict[str, int] = {"cosyvoice": 2}
 
 
 class _NoOpBreaker:
@@ -545,8 +555,12 @@ def call_with_breaker(name: str, fn: Callable, *args, **kwargs):
 
     Raises whatever fn raises (or pybreaker.CircuitBreakerError) — caller
     decides fallback behaviour (canned phrase, partial response, etc.).
+
+    Per-backend fail_max overrides come from _BACKEND_FAIL_MAX; backends
+    without an entry use the global default (5). This is applied on the
+    first get_breaker() call for a name and cached for subsequent calls.
     """
-    breaker = get_breaker(name)
+    breaker = get_breaker(name, fail_max=_BACKEND_FAIL_MAX.get(name, 5))
 
     if not _HAS_TENACITY:
         return breaker.call(fn, *args, **kwargs)

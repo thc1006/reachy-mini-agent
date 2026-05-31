@@ -683,7 +683,13 @@ KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")   # 最甜最高音（af_he
 # elder-care zh-TW and the rare en-US utterance without a second engine.
 # Default endpoint follows the kokoro pattern — override via env on Pi.
 COSYVOICE_URL = os.getenv("COSYVOICE_URL", "http://vllm0528:8881")
-COSYVOICE_TIMEOUT_S = float(os.getenv("COSYVOICE_TIMEOUT_S", "20"))
+# 8 s default (was 20 s pre review-M4). Reasoning: cosyvoice 0.5B fp16 RTF on
+# V100 is ~0.15-0.30, so a typical 5 s utterance synthesizes in ~1-2 s; 8 s
+# already covers the 95th-percentile slow path. Combined with fail_max=2
+# (brain_observability._BACKEND_FAIL_MAX) the worst-case degraded UX before
+# edge takes over is ~16 s (2 × 8 s), down from ~300 s with the old 20 s ×
+# fail_max=5 × tenacity-3-retries math.
+COSYVOICE_TIMEOUT_S = float(os.getenv("COSYVOICE_TIMEOUT_S", "8"))
 
 def _fetch_kokoro_tts_inner(text: str):
     t0 = time.perf_counter()
@@ -731,10 +737,31 @@ def _fetch_cosyvoice_tts_inner(text: str, language: str | None = None):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with _urlreq.urlopen(req, timeout=COSYVOICE_TIMEOUT_S) as resp:
-        wav_bytes = resp.read()
-        gen_s = resp.headers.get("x-gen-latency-s", "?")
-        mode = resp.headers.get("x-mode", "?")
+    try:
+        with _urlreq.urlopen(req, timeout=COSYVOICE_TIMEOUT_S) as resp:
+            wav_bytes = resp.read()
+            gen_s = resp.headers.get("x-gen-latency-s", "?")
+            mode = resp.headers.get("x-mode", "?")
+    except _urlreq.HTTPError as e:
+        # M1 (CosyVoice review): server now classifies failures via
+        # X-Error-Class header (cuda_oom → 503, inference_failed → 500).
+        # Surface that class in structured logs so dashboards can split
+        # GPU-pressure events from "real" failures + the breaker still
+        # counts both as failures and trips fail_max=2 quickly.
+        try:
+            err_class = e.headers.get("x-error-class", "unknown") if e.headers else "unknown"
+        except Exception:
+            err_class = "unknown"
+        try:
+            logger.warning(
+                "cosyvoice_http_error",
+                status=e.code,
+                err_class=err_class,
+                url=COSYVOICE_URL,
+            )
+        except Exception:
+            pass
+        raise
     data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
     print(
         f"  [TTS cosyvoice/{mode}] {(time.perf_counter()-t0)*1000:.0f}ms "
@@ -2978,6 +3005,27 @@ def main():
                 host=HOST,
                 llm_backend=os.getenv("LLM_BACKEND", "ollama"),
                 elder_mode=os.getenv("ELDER_CARE_MODE", "0"))
+
+    # TTS routing deprecation notice (ADR-0009-tts-routing). TTS_BACKEND is
+    # the canonical selector as of 2026-06-01. When BOTH TTS_BACKEND and
+    # TTS_ENGINE are set, TTS_BACKEND wins in _stream_tts and TTS_ENGINE is
+    # never read — operators have been silently surprised by this when they
+    # try to canary HaGen via TTS_ENGINE while production sits on
+    # TTS_BACKEND=edge. Emit a one-shot warning at startup so the override
+    # is visible in journald.
+    if os.getenv("TTS_ENGINE") is not None:
+        _tts_backend_val = os.getenv("TTS_BACKEND", "")
+        try:
+            logger.warning(
+                "tts_engine_deprecated",
+                tts_engine=os.getenv("TTS_ENGINE"),
+                tts_backend=_tts_backend_val,
+                note=("TTS_ENGINE is deprecated; use TTS_BACKEND instead. "
+                      "When both are set, TTS_BACKEND wins. "
+                      "See docs/architecture/ADR-0009-tts-routing.md"),
+            )
+        except Exception:
+            pass
 
     _load_conv_memory()   # ← 啟動時載入 JSONL 歷史
     _prewarm_vllm()       # ← prime vLLM prefix cache before first user turn
