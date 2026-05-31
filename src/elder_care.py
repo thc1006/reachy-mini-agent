@@ -48,14 +48,14 @@ _emergency_log_lock = threading.Lock()
 
 
 # ── Env helpers ───────────────────────────────────────────────────────────
-
-def _truthy(v: str) -> bool:
-    return v.strip().lower() not in ("", "0", "false", "no", "off")
+# Track D-2 (2026-06-01): bool parsing moved to _env. Local alias kept for
+# backward compatibility with any external importers of `elder_care._truthy`.
+from _env import env_bool, is_truthy as _truthy  # noqa: E402,F401
 
 
 def elder_mode_enabled() -> bool:
     """Master gate. False => all helpers no-op / return safe defaults."""
-    return _truthy(os.getenv("ELDER_CARE_MODE", "0"))
+    return env_bool("ELDER_CARE_MODE", default=False)
 
 
 # ── P6: Emergency phrase route ────────────────────────────────────────────

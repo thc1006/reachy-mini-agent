@@ -19,6 +19,11 @@ import sys
 import threading
 import time
 
+# Shared env-bool helper (Track D-2, 2026-06-01). Single source for the
+# repo's `1/true/yes/on` semantics — replaces 7+ ad-hoc strict-`== "1"`
+# sites + the elder_care/_truthy duplicate.
+from _env import env_bool
+
 # Elder-care features (P6/P7/P8) — all NO-OP unless ELDER_CARE_MODE=1.
 # Self-contained module: pure helpers + thin SDK glue. See src/elder_care.py.
 import elder_care
@@ -1417,7 +1422,7 @@ def _transcribe_local(audio: np.ndarray) -> str:
     audio_s = len(audio) / SAMPLE_RATE
     # DEBUG: dump every captured audio so we can listen to what Whisper sees.
     # Drop oldest if /tmp/stt_dump/ has more than 20 files.
-    if os.getenv("STT_DUMP", "0") == "1":
+    if env_bool("STT_DUMP"):
         try:
             _dump_dir = "/tmp/stt_dump"
             os.makedirs(_dump_dir, exist_ok=True)
@@ -1580,7 +1585,7 @@ def _sys_prompt_with_scene(user_text: str = "") -> str:
 LLM_MODE         = os.getenv("LLM_MODE", "vllm").lower()     # informational; routing now single-path
 OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "qwen3:8b")
-OLLAMA_THINK     = os.getenv("OLLAMA_THINK", "0") == "1"
+OLLAMA_THINK     = env_bool("OLLAMA_THINK")
 # vLLM backend (env-toggle). Set LLM_BACKEND=vllm to route every chat call to a
 # local vLLM /v1/chat/completions endpoint (continuous batching + concurrent
 # vision/dialog). Default ollama keeps the legacy local-Ollama path available
@@ -1603,12 +1608,12 @@ def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: st
     return f"http://{host}:{port}"
 
 
-# Manual failover only — VLLM_HOST_BACKUP is parsed but not yet wired to inline
-# retry/circuit-breaker. Operators swap by exporting VLLM_HOST=<backup> + systemctl
-# restart. TODO: cooperative retry on httpx.ConnectError → swap to backup once.
+# VLLM_HOST_BACKUP dropped 2026-06-01 (Track D-2 cleanup). Was parsed but never
+# wired — pybreaker + tenacity in brain_observability already handle inline
+# retry / circuit-breaker. Manual failover: `export VLLM_HOST=<backup> &&
+# systemctl --user restart reachy-brain`.
 VLLM_PORT        = os.getenv("VLLM_PORT", "8000")
 VLLM_HOST        = _vllm_base("VLLM_HOST", "VLLM_PORT", "vllm0528", "8000")
-VLLM_HOST_BACKUP = _vllm_base("VLLM_HOST_BACKUP", "VLLM_PORT_BACKUP", "s1", "8000")
 VLLM_MODEL       = os.getenv("VLLM_MODEL", "qwen36-awq")
 
 import urllib.request as _urlreq
@@ -1788,7 +1793,7 @@ except ImportError as _terr:
     print(f"  [robot_tools 未安裝] {_terr} — tools 停用")
     _TOOLS_AVAILABLE = False
 
-LLM_TOOLS = os.getenv("LLM_TOOLS", "1") == "1" and _TOOLS_AVAILABLE
+LLM_TOOLS = env_bool("LLM_TOOLS", default=True) and _TOOLS_AVAILABLE
 MAX_TOOL_ITERS = int(os.getenv("LLM_TOOL_MAX_ITERS", "3"))
 
 
@@ -2073,7 +2078,7 @@ except ImportError as _imperr:
     print(f"  [streaming_tts 未安裝] {_imperr} — streaming 停用")
     _STREAMING_AVAILABLE = False
 
-LLM_STREAMING = os.getenv("LLM_STREAMING", "1") == "1" and _STREAMING_AVAILABLE
+LLM_STREAMING = env_bool("LLM_STREAMING", default=True) and _STREAMING_AVAILABLE
 
 
 # Cross-chunk <think>...</think> stripper for streaming path. qwen3.6 with
@@ -3004,10 +3009,14 @@ def main():
     # ── Observability bootstrap (early so faulthandler catches startup hangs) ──
     obs.enable_faulthandler(interval_s=60)
     obs.start_metrics_exporter(logger)
+    # Track D-2: log the parsed BOOL not the raw string, so structured-log
+    # consumers see a real true/false (matches what elder_care actually
+    # gates on via env_bool — previously logged `"0"` even though the
+    # behaviour-correct elder_mode_enabled() already used _truthy parsing).
     logger.info("brain_startup_begin",
                 host=HOST,
                 llm_backend=os.getenv("LLM_BACKEND", "ollama"),
-                elder_mode=os.getenv("ELDER_CARE_MODE", "0"))
+                elder_mode=env_bool("ELDER_CARE_MODE"))
 
     # TTS routing deprecation notice (ADR-0009-tts-routing). TTS_BACKEND is
     # the canonical selector as of 2026-06-01. When BOTH TTS_BACKEND and

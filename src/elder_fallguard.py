@@ -51,17 +51,16 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-# ── env helpers (mirror elder_care._truthy so behaviour is consistent) ──────
-
-
-def _truthy(v: str) -> bool:
-    return v.strip().lower() not in ("", "0", "false", "no", "off")
+# ── env helpers ─────────────────────────────────────────────────────────────
+# Track D-2 (2026-06-01): bool parsing moved to _env. Local alias kept for
+# backward compatibility with any external importers of `_truthy`.
+from _env import env_bool, is_truthy as _truthy  # noqa: E402,F401
 
 
 def fallguard_enabled() -> bool:
     """Master gate. Default OFF — production must explicitly opt in after
     human review of FP rate per the Wave4-P4 deploy plan."""
-    return _truthy(os.getenv("ELDER_FALLGUARD_ENABLED", "0"))
+    return env_bool("ELDER_FALLGUARD_ENABLED", default=False)
 
 
 def _model_path() -> str:

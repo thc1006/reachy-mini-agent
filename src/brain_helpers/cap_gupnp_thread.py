@@ -62,12 +62,14 @@ import threading
 import time
 from typing import Callable, Optional
 
+from _env import env_bool
+
 
 # Truncated comm name as the kernel reports it (15-char limit in
 # /proc/$pid/task/$tid/comm).
 GUPNP_COMM_PREFIX = "gupnp-igd-threa"
 
-CAP_ENABLED = os.getenv("BRAIN_GUPNP_CAP_ENABLED", "1") == "1"
+CAP_ENABLED = env_bool("BRAIN_GUPNP_CAP_ENABLED", default=True)
 CAP_CORE = int(os.getenv("BRAIN_GUPNP_CAP_CORE", "3"))
 CAP_INTERVAL_S = int(os.getenv("BRAIN_GUPNP_CAP_INTERVAL", "30"))
 

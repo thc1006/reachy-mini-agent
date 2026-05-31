@@ -46,8 +46,8 @@ def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: st
     return f"http://{host}:{port}"
 
 
-# TODO(blue/green): single-boot auto-failover not wired — VLLM_HOST_BACKUP is
-# currently exposed for manual failover only.
+# Track D-2 (2026-06-01): VLLM_HOST_BACKUP dropped — was never wired.
+# pybreaker + tenacity in brain_observability handle backend resilience.
 VLLM_HOST = _vllm_base("VLLM_HOST", "VLLM_PORT", "vllm0528", "8000")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "qwen36-awq")
 

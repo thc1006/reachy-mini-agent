@@ -22,6 +22,8 @@ import threading
 import time
 from typing import Callable, List, Optional
 
+from _env import env_bool
+
 # YOLOv8n is the smallest practical detector — ~6 MB, ~3-15 ms per 640x480
 # frame on a 3090. Falls back to CPU at ~30-60 ms which is still fine for
 # a 2-Hz cascade.
@@ -37,7 +39,7 @@ _last_trigger_set: frozenset = frozenset()
 
 
 def _maybe_log(msg: str):
-    if os.getenv("CASCADE_VERBOSE", "0") == "1":
+    if env_bool("CASCADE_VERBOSE"):
         print(msg, flush=True)
 
 
@@ -101,7 +103,7 @@ def _worker(stop_event: threading.Event, frame_getter: Callable[[], object]):
 
 def start_cascade(stop_event: threading.Event, frame_getter: Callable[[], object]) -> Optional[threading.Thread]:
     """Start the cascade thread. Returns the Thread or None if disabled."""
-    if os.getenv("VISION_CASCADE", "0") != "1":
+    if not env_bool("VISION_CASCADE"):
         return None
     t = threading.Thread(
         target=_worker, args=(stop_event, frame_getter), daemon=True, name="cascade"

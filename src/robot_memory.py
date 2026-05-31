@@ -32,6 +32,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, List, Optional
 
+from _env import env_bool
+
 # Mem0's internal logger prints WARNINGs directly; quiet it so our own
 # drop-log is the single source of truth in robot_brain output.
 logging.getLogger("mem0").setLevel(logging.ERROR)
@@ -162,7 +164,7 @@ class RobotMemory:
                 "consider tmpfs or external SSD (mmap+compaction write amplification)"
             )
 
-        if os.getenv("ROBOT_MEMORY", "1") != "1":
+        if not env_bool("ROBOT_MEMORY", default=True):
             return   # explicitly disabled
 
         try:
