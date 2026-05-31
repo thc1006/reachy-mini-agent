@@ -678,6 +678,13 @@ def _to_stereo_16k(data: np.ndarray, sr: int) -> np.ndarray:
 KOKORO_URL   = os.getenv("KOKORO_URL", "http://localhost:8880")
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")   # 最甜最高音（af_heart > af_nicole > af_sky > af_bella）
 
+# CosyVoice 2 self-host on vllm0528 (V100 card 0, fp16, 24 kHz output).
+# Multilingual (zh + en + ja + ko) so the same backend can serve both
+# elder-care zh-TW and the rare en-US utterance without a second engine.
+# Default endpoint follows the kokoro pattern — override via env on Pi.
+COSYVOICE_URL = os.getenv("COSYVOICE_URL", "http://vllm0528:8881")
+COSYVOICE_TIMEOUT_S = float(os.getenv("COSYVOICE_TIMEOUT_S", "20"))
+
 def _fetch_kokoro_tts_inner(text: str):
     t0 = time.perf_counter()
     req = _urlreq.Request(
@@ -705,6 +712,82 @@ def _fetch_kokoro_tts(text: str):
     except Exception as e:
         print(f"  [TTS kokoro 失敗] {e}，fallback edge-tts")
         return None
+
+
+def _fetch_cosyvoice_tts_inner(text: str, language: str | None = None):
+    """Raw call to the vllm0528:8881 CosyVoice 2 FastAPI wrapper.
+
+    Posts an OpenAI-shape ``/v1/audio/speech`` request and returns
+    ``(samples, sample_rate)`` decoded from the audio/wav response. The
+    server picks zero_shot vs cross_lingual internally based on the
+    language hint + character heuristics, so we just forward the hint.
+    """
+    t0 = time.perf_counter()
+    payload: dict[str, object] = {"input": text, "voice": "default"}
+    if language:
+        payload["language"] = language
+    req = _urlreq.Request(
+        f"{COSYVOICE_URL}/v1/audio/speech",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with _urlreq.urlopen(req, timeout=COSYVOICE_TIMEOUT_S) as resp:
+        wav_bytes = resp.read()
+        gen_s = resp.headers.get("x-gen-latency-s", "?")
+        mode = resp.headers.get("x-mode", "?")
+    data, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    print(
+        f"  [TTS cosyvoice/{mode}] {(time.perf_counter()-t0)*1000:.0f}ms "
+        f"(GPU gen={gen_s}s, {len(wav_bytes)}B)"
+    )
+    return data, sr
+
+
+def _fetch_cosyvoice_tts(text: str, language: str | None = None):
+    """Sync fetch from vllm0528 CosyVoice → ``(samples, sr)`` or None on failure.
+
+    Wrapped with the shared circuit breaker so an outage on vllm0528 doesn't
+    burn ``COSYVOICE_TIMEOUT_S`` per call indefinitely — the breaker opens
+    after repeated failures and callers fall back to edge-tts.
+    """
+    text = _strip_emoji(text)
+    if not text:
+        return None
+    try:
+        return obs.call_with_breaker(
+            "cosyvoice", _fetch_cosyvoice_tts_inner, text, language
+        )
+    except Exception as e:
+        print(f"  [TTS cosyvoice 失敗] {e}，fallback edge-tts")
+        return None
+
+
+def _detect_tts_language(text: str) -> str:
+    """Cheap language hint for CosyVoice routing.
+
+    Mirrors ``pick_voice`` script counting but returns a 2-letter code instead
+    of a voice name. The CosyVoice server uses this purely as a hint and can
+    still override via its own auto heuristic if we guess wrong.
+    """
+    if not text:
+        return "auto"
+    if text.isascii():
+        return "en"
+    counts: dict[str, int] = {}
+    for c in text:
+        s = _script(c)
+        if s != "ascii":
+            counts[s] = counts.get(s, 0) + 1
+    han = counts.get("han", 0)
+    hira = counts.get("hiragana", 0) + counts.get("katakana", 0)
+    hangul = counts.get("hangul", 0)
+    if hira and hira >= han and hira >= hangul:
+        return "ja"
+    if hangul and hangul >= han and hangul >= hira:
+        return "ko"
+    if han > 0:
+        return "zh"
+    return "auto"
 
 from pathlib import Path as _CachePath
 TTS_CACHE_DIR = _CachePath(os.getenv("TTS_CACHE_DIR", str(_CachePath(__file__).parent / "tts_cache")))
@@ -961,6 +1044,39 @@ async def _stream_tts(text: str, mini) -> None:
     #   hagen  = HaGen v4 cloned voice (GPT-SoVITS on 5090, ZH-only normalized path)
     #   edge   = Microsoft 雲端 Ana / HsiaoYu / etc. (multilingual)
     #   kokoro = GPU 本地 (Kokoro 82M)
+    #
+    # TTS_BACKEND adds a thin policy layer over TTS_ENGINE for the CosyVoice 2
+    # canary roll-out (vllm0528:8881, zh/en/ja/ko multilingual). When set, it
+    # takes precedence so production .env can pin TTS_BACKEND=edge and we
+    # flip individual canary calls via env override without touching the
+    # legacy TTS_ENGINE knob. Recognized values:
+    #   cosyvoice          — vllm0528, edge fallback
+    #   edge               — current behavior (Microsoft cloud)
+    #   kokoro             — kokoro on vllm0528, edge fallback
+    #   edge_then_cosyvoice — try edge first, fall back to cosyvoice
+    backend = os.getenv("TTS_BACKEND", "").lower().strip()
+    if backend == "cosyvoice":
+        lang = _detect_tts_language(text)
+        result = _fetch_cosyvoice_tts(text, language=lang)
+        if result is None:
+            result = await _fetch_edge_tts(text)
+    elif backend == "edge_then_cosyvoice":
+        result = await _fetch_edge_tts(text)
+        if result is None:
+            lang = _detect_tts_language(text)
+            result = _fetch_cosyvoice_tts(text, language=lang)
+    elif backend == "kokoro":
+        result = _fetch_kokoro_tts(text)
+        if result is None:
+            result = await _fetch_edge_tts(text)
+    elif backend == "edge":
+        result = await _fetch_edge_tts(text)
+        if result is None:
+            result = _fetch_kokoro_tts(text)
+    else:
+        result = None  # fall through to TTS_ENGINE legacy switch below
+    if result is not None:
+        return await _emit_tts_audio(result, mini)
     engine = os.getenv("TTS_ENGINE", "kokoro").lower()
     if engine == "hagen":
         # HaGen v4 RCA verdict: content-prior mismatch on formal/intro short text
@@ -998,6 +1114,16 @@ async def _stream_tts(text: str, mini) -> None:
     if result is None:
         print(f"  [TTS 全失敗] text={text[:60]!r}")
         return
+    await _emit_tts_audio(result, mini)
+
+
+async def _emit_tts_audio(result, mini) -> None:
+    """Normalize + push a TTS ``(samples, sr)`` payload through the daemon.
+
+    Factored out of ``_stream_tts`` so both the new ``TTS_BACKEND`` policy
+    branch and the legacy ``TTS_ENGINE`` branch share identical playback /
+    mic-gate / elder-mode pause logic.
+    """
     data, sr = result
     audio = _to_stereo_16k(data, sr)
     # Peak-normalize 到 target_peak，讓每句音量一致 + 吃滿 headroom
@@ -1035,6 +1161,7 @@ async def _stream_tts(text: str, mini) -> None:
         # extra time before the robot resumes listening / next turn starts).
         time.sleep(TTS_TAIL_DRAIN_S + elder_care.extra_post_tts_pause_s())
         _speaking_event.clear()
+
 
 def speak(mini, text: str):
     t0 = time.perf_counter()
