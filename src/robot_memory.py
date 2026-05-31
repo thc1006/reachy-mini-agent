@@ -125,6 +125,7 @@ class RobotMemory:
         self.enabled = False
         self._memory: Any = None
         self._executor: Optional[ThreadPoolExecutor] = None
+        self._max_workers = max(1, int(max_workers))   # captured for lazy re-create after flush
         self._lock = threading.Lock()
         # Rolling summary state
         self.summary_path = summary_path
@@ -299,8 +300,20 @@ class RobotMemory:
             return
         # Cap length — overly long inputs risk numerical overflow at pool layer
         combined = combined[:4000]
+        # H8 fix (2026-06-01): lazy-create the writer pool under self._lock if
+        # flush() has shut it down. Previously flush() did shutdown + replace
+        # in two steps; a concurrent add_turn() landing between the two could
+        # submit to the dying executor (RuntimeError) or worse, race the swap
+        # and lose the submission entirely. Lazy-create gives flush() a cleaner
+        # invariant: it just shuts the pool down and clears it, no re-init.
+        with self._lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers, thread_name_prefix="mem0-writer"
+                )
+            ex = self._executor
         try:
-            self._executor.submit(self._add_safe, combined)
+            ex.submit(self._add_safe, combined)
         except Exception as e:
             print(f"  [robot_memory] submit failed: {e}")
         # Optional own-log (tests). Production (robot_brain._log_turn) handles jsonl.
@@ -634,16 +647,22 @@ class RobotMemory:
     # ------------------------------------------------------------- flush ---
     def flush(self, timeout: float = 60.0) -> None:
         """Block until all pending async add_turn() calls complete.
-        Use in tests or before shutdown. No-op if disabled."""
-        if not self.enabled or self._executor is None:
+        Use in tests or before shutdown. No-op if disabled.
+
+        H8 fix (2026-06-01): previous impl did `shutdown(wait=True)` + immediate
+        `self._executor = ThreadPoolExecutor(...)` in two steps. A concurrent
+        add_turn() landing between the shutdown and the swap would either hit
+        a RuntimeError ("cannot schedule new futures after shutdown") or, if
+        unlucky with scheduling, get its submission silently lost. We now clear
+        the executor reference atomically and let add_turn() lazy-create a
+        fresh pool on the next call — single invariant, no swap window.
+        """
+        if not self.enabled:
             return
-        # ThreadPoolExecutor has no built-in wait-for-all; re-create executor
-        # after draining by shutting down (wait=True) and re-init
-        old = self._executor
-        old.shutdown(wait=True, cancel_futures=False)
-        self._executor = ThreadPoolExecutor(
-            max_workers=old._max_workers, thread_name_prefix="mem0-writer"
-        )
+        with self._lock:
+            old, self._executor = self._executor, None
+        if old is not None:
+            old.shutdown(wait=True, cancel_futures=False)
 
     # ------------------------------------------------------------- close ----
     def close(self, timeout: float = 5.0) -> None:

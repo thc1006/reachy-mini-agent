@@ -319,6 +319,14 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
 
 _resync_timer_lock = _threading.Lock()
 _resync_timer: _threading.Timer | None = None
+# H6 fix (2026-06-01): monotonic generation counter for last-write-wins
+# semantics. Timer.cancel() is best-effort — if the timer already fired and
+# _do_sync is mid-execution (e.g. blocked on the daemon HTTP call) when a
+# newer clip schedules a fresh timer, the old _do_sync would still write
+# a stale baseline AFTER the cancel + after the new timer was created.
+# Each scheduling bumps the counter and snapshots the new value; _do_sync
+# refuses to write the baseline if its snapshot is no longer the latest.
+_resync_gen: int = 0
 
 
 def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_clip") -> None:
@@ -332,33 +340,16 @@ def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_cli
 
     Debounce: if a previous resync timer is still pending, cancel it. A
     second clip fired before the first resync completes supersedes the
-    first — only the LAST clip's expected end time matters. Otherwise N
-    overlapping Timers would create out-of-order baseline writes.
+    first — only the LAST clip's expected end time matters. Timer.cancel()
+    only stops timers that haven't fired yet; an already-running _do_sync
+    is gated by the gen-counter check below so it aborts before writing.
 
     Daemon endpoint: GET /api/state/present_head_pose → {pitch, yaw, roll}.
     On failure (network / unknown format), falls back to neutral (0, 0) —
     most pollen-robotics clips return to neutral, so this is a reasonable
     last-resort default.
     """
-    def _do_sync() -> None:
-        pitch, yaw = 0.0, 0.0
-        try:
-            req = _urlreq.Request(f"{DAEMON_BASE}/api/state/present_head_pose")
-            with _urlreq.urlopen(req, timeout=3) as resp:
-                pose = _json.loads(resp.read().decode("utf-8"))
-            if isinstance(pose, dict):
-                pitch = float(pose.get("pitch", 0.0))
-                yaw   = float(pose.get("yaw", 0.0))
-        except Exception:
-            pass  # fall through to neutral baseline
-        try:
-            import robot_brain as _rb
-            _rb.note_head_command(pitch_deg=pitch, yaw_deg=yaw,
-                                  body_yaw_rad=None, source=source)
-        except Exception:
-            pass
-
-    global _resync_timer
+    global _resync_timer, _resync_gen
     with _resync_timer_lock:
         # Cancel any pending resync — last clip wins, no overlapping writes.
         if _resync_timer is not None:
@@ -366,6 +357,33 @@ def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_cli
                 _resync_timer.cancel()
             except Exception:
                 pass
+        _resync_gen += 1
+        my_gen = _resync_gen
+
+        def _do_sync(my_gen: int = my_gen) -> None:
+            pitch, yaw = 0.0, 0.0
+            try:
+                req = _urlreq.Request(f"{DAEMON_BASE}/api/state/present_head_pose")
+                with _urlreq.urlopen(req, timeout=3) as resp:
+                    pose = _json.loads(resp.read().decode("utf-8"))
+                if isinstance(pose, dict):
+                    pitch = float(pose.get("pitch", 0.0))
+                    yaw   = float(pose.get("yaw", 0.0))
+            except Exception:
+                pass  # fall through to neutral baseline
+            # Re-check generation under the lock right before writing. If a
+            # newer scheduling has happened (user fired another clip while we
+            # were blocked on the daemon HTTP call), abort this stale write.
+            with _resync_timer_lock:
+                if my_gen != _resync_gen:
+                    return
+            try:
+                import robot_brain as _rb
+                _rb.note_head_command(pitch_deg=pitch, yaw_deg=yaw,
+                                      body_yaw_rad=None, source=source)
+            except Exception:
+                pass
+
         _resync_timer = _threading.Timer(max(0.5, float(delay_s)), _do_sync)
         _resync_timer.daemon = True
         _resync_timer.start()

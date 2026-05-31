@@ -1,6 +1,6 @@
 """
 Reachy Mini — 眼神追蹤 + 對話互動系統
-流程：攝影機人臉偵測 → 眼神跟隨 → 主動打招呼 → 麥克風 → Whisper → Claude CLI → TTS
+流程：攝影機人臉偵測 → 眼神跟隨 → 主動打招呼 → 麥克風 → Whisper → vLLM (ADR-0005) → TTS
 
 狀態機：
   IDLE → DETECTED → TRACKING → GREETING → CONVERSATION → COOLDOWN → IDLE
@@ -15,7 +15,6 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -1339,7 +1338,7 @@ def transcribe(audio: np.ndarray) -> str:
             pass
         return out
 
-# ── LLM（Claude CLI）─────────────────────────────────────────────────────────
+# ── LLM（vLLM via Ollama-compat dispatcher, ADR-0005）──────────────────────
 SYSTEM_PROMPT = """\
 You are Reachy Mini, a curious desk robot. Warm, playful, specific, not cartoonish. No emoji prefixes. Be concise — no filler.
 
@@ -1415,22 +1414,21 @@ def _sys_prompt_with_scene(user_text: str = "") -> str:
             f"[END_CAMERA_VIEW]\n"
             f"You may naturally reference what you see if it feels relevant, but don't force it.")
 
-# LLM 路由優先序（自動 failover 鏈）：
-#   1) LiteLLM proxy @ 5090（經 Tailscale，含多模型 fallback: chat→reason）
-#   2) Ollama 直連 @ 5090（繞過 LiteLLM，延遲更低）
-#   3) Anthropic SDK (if ANTHROPIC_API_KEY)
-#   4) Claude CLI — 最後 fallback
-LLM_MODE         = os.getenv("LLM_MODE", "litellm").lower()  # litellm / ollama / claude-sdk / claude-cli
-LITELLM_BASE     = os.getenv("LITELLM_BASE", "http://localhost:4000")
-LITELLM_KEY      = os.getenv("LITELLM_KEY", "")
-LITELLM_MODEL    = os.getenv("LITELLM_MODEL", "chat")        # chat / vision / reason
+# LLM routing (ADR-0005, 2026-04-25): vLLM is the sole production backend.
+# LiteLLM proxy / Anthropic SDK / Claude CLI fallback paths were removed
+# 2026-06-01 after a year on vLLM with zero invocations in production logs.
+# The function name `_ask_via_ollama` is preserved because it speaks the Ollama
+# /api/chat shape; `_ollama_to_openai_payload` translates it for vLLM's
+# /v1/chat/completions endpoint when LLM_BACKEND=vllm (default).
+LLM_MODE         = os.getenv("LLM_MODE", "vllm").lower()     # informational; routing now single-path
 OLLAMA_HOST      = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_THINK     = os.getenv("OLLAMA_THINK", "0") == "1"
 # vLLM backend (env-toggle). Set LLM_BACKEND=vllm to route every chat call to a
 # local vLLM /v1/chat/completions endpoint (continuous batching + concurrent
-# vision/dialog). Default ollama keeps current behaviour.
-LLM_BACKEND      = os.getenv("LLM_BACKEND", "ollama").lower()
+# vision/dialog). Default ollama keeps the legacy local-Ollama path available
+# for development boxes that don't have vLLM running.
+LLM_BACKEND      = os.getenv("LLM_BACKEND", "vllm").lower()
 
 def _vllm_base(host_env: str, port_env: str, default_host: str, default_port: str) -> str:
     """Resolve a vLLM base URL from env vars.
@@ -1455,7 +1453,6 @@ VLLM_PORT        = os.getenv("VLLM_PORT", "8000")
 VLLM_HOST        = _vllm_base("VLLM_HOST", "VLLM_PORT", "vllm0528", "8000")
 VLLM_HOST_BACKUP = _vllm_base("VLLM_HOST_BACKUP", "VLLM_PORT_BACKUP", "s1", "8000")
 VLLM_MODEL       = os.getenv("VLLM_MODEL", "qwen36-awq")
-CLAUDE_MODEL     = "claude-haiku-4-5-20251001"
 
 import urllib.request as _urlreq
 from datetime import datetime, timezone
@@ -1469,26 +1466,43 @@ _conv_lock          = threading.Lock()
 
 # Mem0 long-term memory — 事實萃取 + 跨 session 語意檢索。失敗時 enabled=False
 _robot_memory = None
+# C2 fix (2026-06-01): the eager mem0 warm-up thread (~main()) and the first
+# dialog turn used to race here — both could pass the `is not None` check
+# before either had finished constructing, then both would call RobotMemory()
+# in parallel. Mem0+Qdrant is single-writer on the LMDB lock; the second
+# constructor would silently fail and collapse to a _Noop, losing facts for
+# the rest of the session. Serialize the init under a dedicated lock; the
+# happy path (already-initialized) still skips the lock for free.
+_robot_memory_init_lock = threading.Lock()
 def _get_robot_memory():
     global _robot_memory
+    # Fast path — already initialized; reads of a single object reference are
+    # atomic on CPython, so no lock needed for the common case.
     if _robot_memory is not None:
         return _robot_memory
-    try:
-        from robot_memory import RobotMemory
-        # Pass absolute log path explicitly so summary generation can always find
-        # the same jsonl that robot_brain writes to, regardless of CWD.
-        _robot_memory = RobotMemory(
-            conversation_log_path=str(CONV_LOG_PATH.resolve()),
-        )
-    except Exception as e:
-        print(f"  [mem0 init err] {e}")
-        class _Noop:
-            enabled = False
-            def add_turn(self, *a, **k): pass
-            def search(self, *a, **k): return []
-            def get_rolling_summary(self): return ""
-        _robot_memory = _Noop()
-    return _robot_memory
+    with _robot_memory_init_lock:
+        # Re-check under the lock — another thread may have completed init
+        # while we were waiting. This is the classic double-checked locking
+        # pattern; safe in CPython because the GIL prevents torn writes of
+        # the module-level reference.
+        if _robot_memory is not None:
+            return _robot_memory
+        try:
+            from robot_memory import RobotMemory
+            # Pass absolute log path explicitly so summary generation can always
+            # find the same jsonl that robot_brain writes to, regardless of CWD.
+            _robot_memory = RobotMemory(
+                conversation_log_path=str(CONV_LOG_PATH.resolve()),
+            )
+        except Exception as e:
+            print(f"  [mem0 init err] {e}")
+            class _Noop:
+                enabled = False
+                def add_turn(self, *a, **k): pass
+                def search(self, *a, **k): return []
+                def get_rolling_summary(self): return ""
+            _robot_memory = _Noop()
+        return _robot_memory
 
 # Small TTL cache for mem.search() — the multi-turn tool loop can call the
 # LLM 3-4× for the same user_text, and each bge-m3 + Qdrant round-trip costs
@@ -1605,40 +1619,6 @@ def _history_for_llm() -> list:
     """snapshot 當前 in-memory history（避免在 API call 中途被改）"""
     with _conv_lock:
         return list(_conv_history)
-
-def _ask_via_litellm(text: str) -> dict:
-    """LiteLLM OpenAI-compat：自動多模型 fallback + 中央 log"""
-    t0 = time.perf_counter()
-    payload = {
-        "model": LITELLM_MODEL,
-        "messages": [
-            {"role": "system", "content": _sys_prompt_with_scene(text)},
-            *_history_for_llm(),                    # ← 歷史對話
-            {"role": "user",   "content": text},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 300,
-    }
-    req = _urlreq.Request(
-        f"{LITELLM_BASE}/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {LITELLM_KEY}"},
-    )
-    with _urlreq.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    raw = (data["choices"][0]["message"].get("content") or "").strip()
-    # 如果 content 空但 reasoning_content 有，就接受推理內容（reason alias 會這樣）
-    if not raw:
-        raw = (data["choices"][0]["message"].get("reasoning_content") or "").strip()
-    tokens = data.get("usage", {}).get("completion_tokens", 0)
-    dur_ms = (time.perf_counter() - t0) * 1000
-    rate = (tokens / (dur_ms / 1000)) if dur_ms > 0 else 0
-    print(f"  [LLM litellm/{LITELLM_MODEL}] {dur_ms:.0f}ms / {tokens} tok → {rate:.1f} tok/s")
-    s, e = raw.find("{"), raw.rfind("}") + 1
-    if s != -1 and e > s:
-        return json.loads(raw[s:e])
-    return {"speech": raw, "actions": []}
 
 # S5: Optional tool calling. Enabled by env LLM_TOOLS=1 (default on).
 # Both streaming and non-streaming paths now pass tools to the LLM. Streaming
@@ -1926,44 +1906,6 @@ def _ask_via_ollama_inner(text: str) -> dict:
         return {"speech": sp, "actions": ac}
     # Too many tool iters — bail
     return {"speech": "Hmm, I got stuck. Let me try again.", "actions": []}
-
-_anthropic_client = None
-def _get_anthropic():
-    global _anthropic_client
-    if _anthropic_client is None:
-        from anthropic import Anthropic
-        _anthropic_client = Anthropic()
-    return _anthropic_client
-
-def _ask_via_sdk(text: str) -> dict:
-    msg = _get_anthropic().messages.create(
-        model=CLAUDE_MODEL, max_tokens=256, system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": text}],
-    )
-    raw = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
-    s, e = raw.find("{"), raw.rfind("}") + 1
-    if s != -1 and e > s:
-        return json.loads(raw[s:e])
-    return {"speech": raw, "actions": []}
-
-def _ask_via_cli(text: str) -> dict:
-    prompt = f"{SYSTEM_PROMPT}\n\nUser said: {text}"
-    r = subprocess.run(
-        ["claude", "-p", prompt, "--model", CLAUDE_MODEL],
-        capture_output=True, text=True, encoding="utf-8", timeout=20,
-    )
-    raw = r.stdout.strip()
-    s, e = raw.find("{"), raw.rfind("}") + 1
-    if s != -1 and e > s:
-        return json.loads(raw[s:e])
-    return {"speech": raw, "actions": []}
-
-# 啟動時檢查 Claude fallback 是否可用，避免每次 fallback 都 fork 失敗汙染 log
-import shutil as _shutil
-_HAS_ANTHROPIC_KEY = bool(os.getenv("ANTHROPIC_API_KEY"))
-_HAS_CLAUDE_CLI    = _shutil.which("claude") is not None
-if not (_HAS_ANTHROPIC_KEY or _HAS_CLAUDE_CLI):
-    print("  [LLM] 無 ANTHROPIC_API_KEY 且 PATH 無 'claude' CLI — Claude fallback 關閉")
 
 # ── S2 Streaming: LLM → sentence chunker → TTS queue → robot speaker ────────
 # 把感知延遲從「等整句 LLM + 等 TTS」砍成「第一句 LLM + 第一句 TTS 就開始播」
@@ -2349,32 +2291,15 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
 
 
 def ask_llm(text: str) -> dict:
-    """多層 failover：litellm → ollama → claude-sdk (if key) → claude-cli (if on PATH)"""
-    claude_route = None
-    if _HAS_ANTHROPIC_KEY:
-        claude_route = ("claude-sdk", _ask_via_sdk)
-    elif _HAS_CLAUDE_CLI:
-        claude_route = ("claude-cli", _ask_via_cli)
-    if LLM_MODE == "litellm":
-        routes = [("litellm", _ask_via_litellm), ("ollama-direct", _ask_via_ollama)]
-        if claude_route: routes.append(claude_route)
-    elif LLM_MODE == "ollama":
-        routes = [("ollama", _ask_via_ollama)]
-        if claude_route: routes.append(claude_route)
-    elif LLM_MODE == "claude-sdk":
-        routes = [("claude-sdk", _ask_via_sdk)]
-        if _HAS_CLAUDE_CLI: routes.append(("claude-cli", _ask_via_cli))
-    else:
-        routes = [("claude-cli", _ask_via_cli)] if _HAS_CLAUDE_CLI else [("ollama", _ask_via_ollama)]
-    last_err = None
-    for name, fn in routes:
-        try:
-            return fn(text)
-        except Exception as ex:
-            last_err = ex
-            print(f"  [LLM {name} 失敗] {ex}，嘗試下一路")
-    print(f"  [LLM 全路徑失敗] {last_err}")
-    return {"speech": "Hmm, say that again?", "actions": []}
+    """Single-path dispatch to the configured backend (vLLM via Ollama-compat
+    payload by default; raw Ollama for dev boxes). Multi-provider failover
+    was removed 2026-06-01 — see ADR-0005. Backend-level resilience now lives
+    inside _ask_via_ollama (pybreaker + tenacity + canned-phrase fallback)."""
+    try:
+        return _ask_via_ollama(text)
+    except Exception as ex:
+        print(f"  [LLM 失敗] {ex}")
+        return {"speech": "Hmm, say that again?", "actions": []}
 
 # ── STT 噪音過濾 ─────────────────────────────────────────────────────────────
 # 348 輪歷史分析：51% 輸入 ≤3 字且多為 "Way / You / Ah. / uh"，這些進 LLM 會產生
@@ -2468,7 +2393,7 @@ def do_conversation(mini):
         print(f"  你說：{text}")
         speech, actions = "", []
         streamed = False
-        if LLM_STREAMING and LLM_MODE == "ollama":
+        if LLM_STREAMING:
             try:
                 speech, actions = _ask_and_speak_streaming(text, mini)
                 streamed = True
@@ -2566,9 +2491,13 @@ def tracking_loop(mini, stop_event: threading.Event):
     # send_command raises ConnectionError("Lost connection with the server.")
     # and the loop would otherwise spin emitting identical errors until
     # manual intervention. After LOST_CONN_LIMIT consecutive Lost-connection
-    # exceptions we os._exit(2) so systemd Restart=on-failure brings the
-    # service back clean (Plan A startup baseline sync + Plan C motor-state
-    # poll re-initialize correctly on restart). 3 × ~0.03 s per tracking
+    # exceptions we raise SystemExit(2) — main()'s `with ReachyMini(...)`
+    # finally block then tears down GStreamer / daemon WebSocket / PortAudio
+    # before exit, and systemd Restart=on-failure brings the service back
+    # clean (Plan A startup baseline sync + Plan C motor-state poll
+    # re-initialize correctly on restart). Previously this path called
+    # os._exit(2) which skipped the cleanup and routinely left zombie
+    # GStreamer pipelines + ALSA xruns on restart. 3 × ~0.03 s per tracking
     # iter = ~0.1 s detection vs the previous unbounded spin.
     LOST_CONN_LIMIT = 3
     lost_conn_count = 0
@@ -2698,7 +2627,12 @@ def tracking_loop(mini, stop_event: threading.Event):
                                 flush=True,
                             )
                             stop_event.set()
-                            os._exit(2)   # skip cleanup that uses dead socket
+                            # SystemExit propagates through the worker thread's
+                            # join and unwinds main()'s `with ReachyMini(...)`
+                            # finally block so GStreamer / WebSocket / PortAudio
+                            # tear down cleanly. Previously os._exit(2) skipped
+                            # that cleanup and left zombie pipelines on restart.
+                            raise SystemExit(2)
                     else:
                         lost_conn_count = 0   # different error → reset
                 finally:

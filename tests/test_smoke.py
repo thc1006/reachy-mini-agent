@@ -40,10 +40,9 @@ def test_env_example_covers_every_getenv():
             keys.add(m.group(1))
 
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    # ANTHROPIC_API_KEY is commented-out optional, allow it missing from the
-    # uncommented section.
-    allow_missing = {"ANTHROPIC_API_KEY", "LITELLM_MODEL", "OLLAMA_THINK",
-                     "LITELLM_KEY", "LITELLM_BASE", "TTS_CACHE_DIR",
+    # OLLAMA_THINK / TTS_CACHE_DIR / WHISPER_* are dev-box overrides not
+    # advertised in the production .env.example.
+    allow_missing = {"OLLAMA_THINK", "TTS_CACHE_DIR",
                      "WHISPER_COMPUTE", "WHISPER_MODEL"}
     missing = [k for k in keys if k not in env_example and k not in allow_missing]
     assert not missing, f".env.example missing docs for: {missing}"
