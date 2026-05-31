@@ -28,14 +28,14 @@ classifiers = [
 dependencies = [
     # Robot SDK
     "reachy-mini>=1.6.3",
-    # LLM clients (optional depending on LLM_MODE)
-    "anthropic>=0.94.1",
-    # Speech
+    # Speech (cloud TTS — always required)
     "edge-tts>=7.2.8",
-    "faster-whisper>=1.2.1",
-    # Vision
-    "mediapipe>=0.10.33",
-    "opencv-python>=4.10",
+    # Vision — mediapipe floor matches Pi aarch64 wheel availability (0.10.14),
+    # required for elder_fallguard.py PoseLandmarker (dormant by default).
+    "mediapipe>=0.10.14",
+    # opencv-python-headless: no GUI deps for server/Pi. Brain uses only
+    # cvtColor/imencode/resize/YuNet — no contrib modules needed.
+    "opencv-python-headless>=4.10",
     # Audio I/O
     "pyaudio>=0.2.14",
     "soundfile>=0.13.1",
@@ -59,6 +59,12 @@ servers = ["fastapi>=0.115", "uvicorn>=0.32", "pydantic>=2.5"]
 # stores vectors on disk (no server), Ollama client is used to reach local
 # bge-m3 for embeddings + qwen3.6 for the extraction LLM call.
 memory = ["mem0ai>=2.0", "qdrant-client>=1.17", "ollama>=0.6"]
+# Local STT fallback only. Production Pi uses remote vllm0528:9000 Whisper;
+# faster-whisper is NOT installed on Pi venv. Optional for dev boxes.
+stt-local = ["faster-whisper>=1.2.1"]
+# Anthropic SDK fallback (LLM_MODE=anthropic). Production runs vLLM per
+# ADR-0005. Optional only — not installed on Pi.
+claude = ["anthropic>=0.94.1"]
 # Hugging Face CLI is used by the bench / dev scripts that download GGUF
 # weights; not required at runtime.
 dev    = ["huggingface-hub[cli]>=1.3", "pytest>=8.0", "pandas>=2.0", "matplotlib>=3.10"]
