@@ -42,6 +42,12 @@ import brain_observability as obs
 # from HuggingFace once per 24h with disk cache + bundled fallback.
 from motion_catalog import MOTION_CATALOG
 
+# Wave4-P3 (#73) Option B: cooperative motion abort signal for barge-in.
+# When user speech is detected mid-motion (e.g. user starts talking during
+# do_action), we set the event so the running goto/sleep loop bails out
+# at its next 50 ms poll. See src/motion_abort.py for the why-not-queue.
+import motion_abort
+
 # CUDA 穩定性：lazy load 減記憶體碎片、CUDA 0 固定
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -622,35 +628,105 @@ else:
 
 # ── 動作庫 ────────────────────────────────────────────────────────────────────
 def do_action(mini, action: str):
+    """Run a named action (nod/shake/happy/think/greet/look_around).
+
+    Wave4-P3 (#73 Option B) barge-in: every inter-step sleep is wrapped in
+    `motion_abort.interruptible_sleep`, so if user speech is detected
+    mid-action the running sub-step bails out within ~50 ms and we log
+    `motion_aborted_at_step{step,total}` for observability. The dialog
+    state-machine call site that detects user voice is responsible for
+    calling `motion_abort.request_abort(reason)` BEFORE flipping state;
+    we clear the flag on entry here so a stale abort from the previous
+    action cannot kill the next one.
+    """
+    motion_abort.clear_abort()
     with _motion_lock:
         try:
             if action == "nod":
-                for z in [8, 0, 8, 0]:
+                steps = [8, 0, 8, 0]
+                for i, z in enumerate(steps):
                     mini.goto_target(head=create_head_pose(z=z, mm=True), duration=0.35, method="minjerk")
-                    time.sleep(0.38)
+                    if motion_abort.interruptible_sleep(0.38):
+                        try:
+                            logger.info("motion_aborted_at_step",
+                                        action=action, step=i + 1, total=len(steps))
+                        except Exception:
+                            pass
+                        try:
+                            obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                        except Exception:
+                            pass
+                        return
             elif action == "shake":
-                for a in [18, -18, 10, -10, 0]:
+                steps = [18, -18, 10, -10, 0]
+                for i, a in enumerate(steps):
                     mini.goto_target(body_yaw=np.deg2rad(a), duration=0.25, method="minjerk")
-                    time.sleep(0.3)
+                    if motion_abort.interruptible_sleep(0.3):
+                        try:
+                            logger.info("motion_aborted_at_step",
+                                        action=action, step=i + 1, total=len(steps))
+                        except Exception:
+                            pass
+                        try:
+                            obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                        except Exception:
+                            pass
+                        return
             elif action == "happy":
                 mini.goto_target(antennas=np.deg2rad([70, 70]), head=create_head_pose(z=6, mm=True),
                                  duration=0.5, method="cartoon")
-                time.sleep(0.8)
+                if motion_abort.interruptible_sleep(0.8):
+                    try:
+                        logger.info("motion_aborted_at_step", action=action, step=1, total=2)
+                        obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                    except Exception:
+                        pass
+                    return
                 mini.goto_target(antennas=np.deg2rad([0, 0]), head=create_head_pose(z=0, mm=True),
                                  duration=0.5, method="minjerk")
-                time.sleep(0.5)
+                if motion_abort.interruptible_sleep(0.5):
+                    try:
+                        logger.info("motion_aborted_at_step", action=action, step=2, total=2)
+                        obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                    except Exception:
+                        pass
+                    return
             elif action == "think":
                 mini.goto_target(head=create_head_pose(y=8, mm=True), duration=0.7, method="ease_in_out")
-                time.sleep(1.6)
+                if motion_abort.interruptible_sleep(1.6):
+                    try:
+                        logger.info("motion_aborted_at_step", action=action, step=1, total=2)
+                        obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                    except Exception:
+                        pass
+                    return
                 mini.goto_target(head=create_head_pose(y=0, mm=True), duration=0.5, method="minjerk")
-                time.sleep(0.5)
+                if motion_abort.interruptible_sleep(0.5):
+                    try:
+                        logger.info("motion_aborted_at_step", action=action, step=2, total=2)
+                        obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                    except Exception:
+                        pass
+                    return
             elif action == "greet":
                 mini.goto_target(antennas=np.deg2rad([50, 50]), body_yaw=np.deg2rad(15),
                                  duration=0.4, method="minjerk")
-                time.sleep(0.45)
+                if motion_abort.interruptible_sleep(0.45):
+                    try:
+                        logger.info("motion_aborted_at_step", action=action, step=1, total=2)
+                        obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                    except Exception:
+                        pass
+                    return
                 mini.goto_target(antennas=np.deg2rad([0, 0]), body_yaw=np.deg2rad(0),
                                  duration=0.4, method="minjerk")
-                time.sleep(0.45)
+                if motion_abort.interruptible_sleep(0.45):
+                    try:
+                        logger.info("motion_aborted_at_step", action=action, step=2, total=2)
+                        obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                    except Exception:
+                        pass
+                    return
             elif action == "look_around":
                 # 立體搜尋：左/右 + 上下抬頭（找高處/低處的人）
                 # (body_yaw_deg, head_pitch_deg)：pitch 正=低頭、負=抬頭
@@ -661,13 +737,23 @@ def do_action(mini, action: str):
                     (0,    8),   # 中 + 微低頭（找坐著的人）
                     (0,    0),   # 回中性
                 ]
-                for body_deg, pitch_deg in poses:
+                for i, (body_deg, pitch_deg) in enumerate(poses):
                     mini.goto_target(
                         head=create_head_pose(pitch=pitch_deg),
                         body_yaw=np.deg2rad(body_deg),
                         duration=0.9, method="minjerk",
                     )
-                    time.sleep(1.0)
+                    if motion_abort.interruptible_sleep(1.0):
+                        try:
+                            logger.info("motion_aborted_at_step",
+                                        action=action, step=i + 1, total=len(poses))
+                        except Exception:
+                            pass
+                        try:
+                            obs.brain_motion_abort_total.labels(reason="in_step").inc()
+                        except Exception:
+                            pass
+                        return
         except Exception as e:
             print(f"  [動作錯誤] {action}: {e}")
 
@@ -2511,6 +2597,22 @@ def do_conversation(mini):
             except Exception:
                 pass
             break
+        # Wave4-P3 (#73) Option B: barge-in. We just captured a real
+        # user utterance (post-VAD, non-empty). If the previous turn's
+        # background do_action thread is still running, signal it to
+        # bail out at its next 50 ms poll so the robot doesn't keep
+        # nodding / dancing while the new turn's STT+LLM is in flight.
+        # The flag is auto-cleared on next do_action entry, so a single
+        # set here cannot leak to a future action.
+        try:
+            motion_abort.request_abort("user_voice_detected")
+            logger.info("motion_abort_requested", reason="user_voice_detected")
+        except Exception:
+            pass
+        try:
+            obs.brain_motion_abort_total.labels(reason="user_voice_detected").inc()
+        except Exception:
+            pass
         t_turn = time.perf_counter()
         text = transcribe(audio)
         if not text:

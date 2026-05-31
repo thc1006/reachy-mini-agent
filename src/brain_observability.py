@@ -283,6 +283,11 @@ fall_webhook_outcome_total: object = _NoOpMetric()
 motion_actions_total: object = _NoOpMetric()
 motion_queue_depth: object = _NoOpMetric()
 motion_run_seconds: object = _NoOpMetric()
+# Wave4-P3 (#73) Option B: barge-in. Increments when motion_abort.request_abort
+# fires (reason=user_voice_detected | external) and when do_action observes
+# the abort mid-step (reason=in_step). Both labels coexist per abort event
+# so you can sanity-check the dispatch→handle path matches.
+brain_motion_abort_total: object = _NoOpMetric()
 
 # Wave6-P4 (2026-05-29): on-demand VLM tool_call observability. Counts each
 # LLM-emitted `query_vision` invocation broken down by outcome so we can spot
@@ -301,6 +306,7 @@ def init_metrics() -> bool:
     global llm_fallback_total, stt_fallback_total, tts_fallback_total
     global fall_events_total, fall_state, fall_webhook_outcome_total
     global motion_actions_total, motion_queue_depth, motion_run_seconds
+    global brain_motion_abort_total
     global vision_tool_call_total
     global _metrics_initialized
     if not _HAS_PROMETHEUS:
@@ -393,6 +399,11 @@ def init_metrics() -> bool:
                 "brain_motion_run_seconds",
                 "Wall time from MotionQueue start→completed/aborted per action",
                 buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+            )
+            brain_motion_abort_total = Counter(
+                "brain_motion_abort_total",
+                "Cooperative motion abort events (Wave4-P3 #73 Option B barge-in)",
+                ["reason"],  # user_voice_detected | in_step | external
             )
             vision_tool_call_total = Counter(
                 "brain_vision_tool_call_total",

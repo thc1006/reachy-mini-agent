@@ -5,6 +5,22 @@ All notable changes to this project will be documented here. Format based on [Ke
 ## [Unreleased]
 
 ### Added
+- **Cooperative motion abort (barge-in)** (Wave4-P3 #73, Option B). New
+  `src/motion_abort.py` exposes a module-global `threading.Event` with
+  `request_abort` / `clear_abort` / `is_aborted` / `interruptible_sleep`.
+  `do_action` (nod/shake/happy/think/greet/look_around) now polls the
+  flag between sub-steps and bails out within ~50 ms. The dialog loop
+  fires `request_abort("user_voice_detected")` the moment
+  `record_utterance` returns a real capture, so any in-flight emotion
+  from the previous turn stops while STT runs. New Prometheus counter
+  `brain_motion_abort_total{reason}` and structlog events
+  `motion_abort_requested` / `motion_aborted_at_step`. **Note**: this
+  intentionally replaces the original 3-layer (POSTURE/GESTURE/BARGE_IN)
+  layered-motion-queue spec — the earlier 446 LOC + 248 test stash
+  (verdict #92 RESTART_FRESH, dropped in Track D-1 cleanup) was over-
+  engineered for the single-user elder-care scenario. Priority queue,
+  worker thread, and layer composition are DEFERRED; revisit only if a
+  real multi-source motion conflict emerges.
 - **Unified vision-language model**: retired the separate `qwen2.5vl:7b`
   worker; `qwen3.6:35b-a3b` (MoE, 3 B active, MMMU 81.7, RefCOCO 92) now
   serves both dialog and vision, saving ~6 GB VRAM on GPU 0 and cutting
