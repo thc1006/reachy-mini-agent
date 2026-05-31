@@ -18,6 +18,9 @@ import soundfile as sf
 from fastapi import FastAPI, Request, HTTPException
 from faster_whisper import WhisperModel
 
+# Production on vllm0528 sets WHISPER_MODEL=/home/hctsai1006/models/Breeze-ASR-25-int8
+# (verified PID 73557 environ 2026-06-01). The "large-v3-turbo" fallback default is
+# kept only for non-prod / dev boxes that don't have Breeze weights locally.
 MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3-turbo")
 COMPUTE    = os.getenv("WHISPER_COMPUTE", "int8_float16")
 

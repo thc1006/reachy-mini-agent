@@ -560,10 +560,13 @@ def _current_scene() -> str:
             return _scene_desc
     return ""
 
-# ── Whisper（RTX 3050 4GB：large-v3-turbo + int8_float16，~2.5GB VRAM）─────
-# large-v3-turbo 是 distilled 版，精度接近 large-v3、速度近 small
-# 首次啟動會從 HF 下載 ~1.6GB 模型（deepdml/faster-whisper-large-v3-turbo-ct2）
-WHISPER_MODEL    = "large-v3-turbo"
+# ── Whisper STT — remote-only via vllm0528:9000 (V100 GPU) ─────────────────
+# Production model: Breeze-ASR-25 (zh-TW fine-tune) running int8_float16 on V100.
+# WHISPER_MODEL constant is informational only; the actual model is decided by
+# the WHISPER_MODEL env var on vllm0528 (run_whisper.sh). The brain only sends
+# audio bytes to the server — it does not load any local Whisper model.
+# Stale RTX 3050 setup is dead code path (removed when brain moved to Pi 2026-05-29).
+WHISPER_MODEL    = "Breeze-ASR-25"  # informational only — see vllm0528 env
 WHISPER_BEAM     = 3
 WHISPER_VAD      = True        # 內建 Silero VAD，自動略過無聲段 → 更快 + 更準
 
@@ -1358,7 +1361,7 @@ def _transcribe_via_5090(audio: np.ndarray) -> str | None:
                 dur_ms = (time.perf_counter() - t0) * 1000
                 audio_s = len(audio) / SAMPLE_RATE
                 rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
-                print(f"  [STT faster-whisper/large-v3-turbo GPU] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
+                print(f"  [STT remote/{WHISPER_MODEL}] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
                 _text = (data.get("text") or "").strip()
                 # Visibility: remote VAD/no_speech rejection returns empty text;
                 # do_conversation's `if not text: continue` would otherwise swallow
@@ -1395,7 +1398,7 @@ def _transcribe_via_5090(audio: np.ndarray) -> str | None:
         dur_ms = (time.perf_counter() - t0) * 1000
         audio_s = len(audio) / SAMPLE_RATE
         rtf = dur_ms / (audio_s * 1000) if audio_s > 0 else 0
-        print(f"  [STT whisper.cpp/large-v3-turbo GPU] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
+        print(f"  [STT whisper.cpp remote/{WHISPER_MODEL}] {dur_ms:.0f}ms / {audio_s:.1f}s (RTF={rtf:.2f})")
         _text = (data.get("text") or "").strip()
         if not _text and audio_s > 0.5:
             print(f"  [STT empty result remote] {audio_s:.1f}s audio → server returned no text")
