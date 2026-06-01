@@ -103,6 +103,10 @@ conversation_summary.txt.watermark
 /_publishing_drafts/
 /_wake_probe/
 
+# Scratch / probe 暫存 — Claude session 的拋棄式測試腳本與抓回的 log dump。
+# 不是程式碼、不該進版控（見 CLAUDE.md「canonical code 在哪」）。
+/docs/drafts/
+
 # Bench / eval / recording output dirs at root (Group D)
 /bench_data_*/
 /chatterbox_eval_out/
