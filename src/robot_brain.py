@@ -441,6 +441,38 @@ _state       = State.IDLE
 _state_lock  = threading.Lock()
 _motion_lock = threading.Lock()
 
+# ── 追蹤抑制窗（2026-06-01 永久修「看左右 / 跳舞被 face tracker 蓋掉」）──────────
+# 真因：face tracker 每幀送 set_target 把人臉重新置中。明確手勢（move_head 看左右、
+# do_action 動作、play_emotion 跳舞/情緒）一送出，下一個 ~50ms tracking 迴圈就用
+# set_target 把馬達拉回置中、抵銷掉手勢。修法：手勢觸發時設一個時間窗，tracker 在
+# 窗內跳過 set_target，手勢做完並 hold 一下才恢復追蹤。用 monotonic 時戳而非 lock：
+# daemon 的 goto/play 是非同步的（回 UUID 立刻返回、馬達之後才動），lock 在 HTTP
+# 返回時就放開、擋不住非同步那段，時間窗才擋得住。
+_track_pause_until = 0.0                 # monotonic 截止時戳
+_track_pause_lock = threading.Lock()
+# 手勢做完後額外 hold 多久才恢復追蹤（讓使用者看清楚、不會瞬間彈回置中）。
+GESTURE_TRACK_HOLD_S = float(os.getenv("GESTURE_TRACK_HOLD_S", "2.0"))
+# 各 do_action 動作的大約執行秒數（用來算抑制窗）。未列出的用預設值。
+_GESTURE_SECS = {"look_around": 5.5, "nod": 1.8, "shake": 1.8,
+                 "happy": 1.5, "think": 2.4, "greet": 1.2}
+
+def pause_tracking(seconds: float) -> None:
+    """抑制 face tracker 的 set_target ``seconds`` 秒，讓明確手勢做完並 hold 住、
+    不被追蹤置中抵銷。已在窗內則延長（取較晚者）。可被任何 thread 呼叫。"""
+    global _track_pause_until
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if s <= 0:
+        return
+    with _track_pause_lock:
+        _track_pause_until = max(_track_pause_until, time.monotonic() + s)
+
+def _tracking_paused() -> bool:
+    """True 表示目前在手勢抑制窗內、tracker 應跳過 set_target。"""
+    return time.monotonic() < _track_pause_until
+
 def get_state() -> State:
     with _state_lock:
         return _state
@@ -651,6 +683,8 @@ def do_action(mini, action: str):
     action cannot kill the next one.
     """
     motion_abort.clear_abort()
+    # 抑制 face tracker：手勢執行 + hold 期間不讓追蹤搶馬達把頭轉回置中。
+    pause_tracking(_GESTURE_SECS.get(action, 2.5) + GESTURE_TRACK_HOLD_S)
     with _motion_lock:
         try:
             if action == "nod":
@@ -1364,9 +1398,17 @@ def _record_via_robot_mic(mini, timeout: float) -> np.ndarray | None:
     voiced_s   = 0.0   # 累積「真的超過門檻」的秒數、用來擋單一雜訊 spike
     has_speech = False
     t_start    = time.time()
+    # 最長單句錄音上限（2026-06-02）：喇叭聲洩漏回 mic（音量調大時）會讓 VAD 永遠
+    # 判「有語音」、silent_s 永遠歸零 → 卡在錄音迴圈直到 timeout、體感「卡死」。
+    # 正常一句話 < 12s，超過幾乎一定是回授/環境噪音 latch。強制停止避免卡死。
+    MAX_UTTER_S = float(os.getenv("MAX_UTTER_S", "12"))
     print(f"  [聆聽 robot] ", end="", flush=True)
     while True:
-        if time.time() - t_start > timeout:
+        now = time.time()
+        if now - t_start > timeout:
+            break
+        if has_speech and (now - t_start) > MAX_UTTER_S:
+            print(" [達最長錄音上限、強制停]", end="", flush=True)
             break
         sample = mini.media.get_audio_sample()   # shape (N, 2) float32 @ 16kHz
         if sample is None:
@@ -1445,6 +1487,57 @@ def record_utterance(mini, timeout: float = CONVO_TIMEOUT) -> np.ndarray | None:
 WHISPER_URL = os.getenv("WHISPER_URL", "http://localhost:8881")
 _whisper_lock = threading.Lock()
 
+def _stt_agc(audio):
+    """STT 自動增益（2026-06-01 永久修「忽大忽小、小聲收不到」）。
+    機器人麥克風常錄到 rms ~0.003-0.01 的弱訊號、落在 Breeze-ASR 的語音地板下
+    → server 回空 → 體感「不理我 / 多輪斷」。把音量正規化到目標 RMS、但設增益
+    上限 + 靜音保護：弱「語音」會被放大到可辨識、純房間噪音不會被放大成幻覺。
+    實測(2026-06-01)：使用者語音 dump 出 rms 0.0068-0.0152、AGC 拉到 ~0.08 後
+    Breeze 正確轉錄。env：STT_AGC(預設開)/STT_AGC_TARGET_RMS(0.08)/STT_AGC_MAX_GAIN(12)。
+    回傳 (處理後音訊, 套用的增益倍率)；增益=1.0 表示未改動。"""
+    try:
+        if not env_bool("STT_AGC", default=True) or audio is None or len(audio) == 0:
+            return audio, 1.0
+        target = float(os.getenv("STT_AGC_TARGET_RMS", "0.08"))
+        max_gain = float(os.getenv("STT_AGC_MAX_GAIN", "20"))
+        # 靜音裁切（2026-06-01 實測：10s buffer raw 回空、裁成語音密集段+AGC 後轉出
+        # 「好」）。麥克風弱訊號常是「大段靜音 + 短弱語音」，Breeze 看整段以為無語音
+        # 回空。裁掉首尾低能量、只留語音段（前後留 0.15s pad），讓語音佔比拉高 +
+        # AGC 用語音段算增益更準。env STT_TRIM 預設開。
+        # STT_TRIM 預設關（2026-06-01 實測：silence-trim 一救一害 — 有時把原本收到
+        # 的語音切掉成空，淨效益不穩、且可能破壞既有成功案例。保留 code 供調校、預設 off。
+        if env_bool("STT_TRIM", default=False) and len(audio) > SAMPLE_RATE // 2:
+            a64 = audio.astype(np.float64)
+            # 20ms 視窗的滑動 RMS、找超過動態門檻的語音區間
+            win = max(1, SAMPLE_RATE // 50)
+            n_win = len(a64) // win
+            if n_win > 4:
+                w = a64[:n_win * win].reshape(n_win, win)
+                wr = np.sqrt(np.mean(w ** 2, axis=1))
+                noise = float(np.percentile(wr, 20))   # 噪音地板估計
+                thr = max(noise * 2.5, 0.004)
+                voiced = np.where(wr > thr)[0]
+                if len(voiced) >= 2:
+                    pad = SAMPLE_RATE * 15 // 100   # 0.15s
+                    i0 = max(0, voiced[0] * win - pad)
+                    i1 = min(len(audio), (voiced[-1] + 1) * win + pad)
+                    if i1 - i0 >= win * 4:
+                        audio = audio[i0:i1]
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+        if rms < 1e-4:
+            return audio, 1.0          # 近乎靜音 — 不要製造噪音
+        gain = target / rms
+        if gain <= 1.0:
+            return audio, 1.0          # 已夠大聲 — 保留自然動態
+        gain = min(gain, max_gain)
+        out = (audio * gain).astype(audio.dtype)
+        peak = float(np.max(np.abs(out)))
+        if peak > 0.99:
+            out = (out * (0.99 / peak)).astype(audio.dtype)
+        return out, gain
+    except Exception:
+        return audio, 1.0
+
 def _transcribe_via_5090(audio: np.ndarray) -> str | None:
     """Send WAV to remote Whisper server. On failure return None.
 
@@ -1457,6 +1550,30 @@ def _transcribe_via_5090(audio: np.ndarray) -> str | None:
         return None
     try:
         t0 = time.perf_counter()
+        # 2026-06-01: STT_DUMP must work in remote-only mode too. The original
+        # dump lived only in _transcribe_local(), which is NEVER reached when
+        # WHISPER_URL is set (remote returns "" not None → no local fallback).
+        # Dump the actual audio sent to the server + log RMS/peak so we can tell
+        # "mic captured noise/too-quiet" apart from "server rejects good audio".
+        if env_bool("STT_DUMP"):
+            try:
+                _aud_s = len(audio) / SAMPLE_RATE
+                _rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))) if len(audio) else 0.0
+                _peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+                _dd = "/tmp/stt_dump"
+                os.makedirs(_dd, exist_ok=True)
+                _fs = sorted(os.listdir(_dd))
+                while len(_fs) >= 20:
+                    os.remove(os.path.join(_dd, _fs.pop(0)))
+                sf.write(f"{_dd}/{time.strftime('%H%M%S')}_{int(_aud_s*1000)}ms_rms{_rms:.4f}.wav",
+                         audio, SAMPLE_RATE)
+                print(f"  [STT_DUMP] {_aud_s:.1f}s rms={_rms:.4f} peak={_peak:.3f}", flush=True)
+            except Exception:
+                pass
+        # AGC：弱訊號放大到可辨識（看 _stt_agc）。在 dump 之後、送 server 之前。
+        audio, _agc_gain = _stt_agc(audio)
+        if _agc_gain > 1.0:
+            print(f"  [STT_AGC] gain x{_agc_gain:.1f}", flush=True)
         buf = io.BytesIO()
         sf.write(buf, audio, SAMPLE_RATE, format="WAV")
         wav_bytes = buf.getvalue()
@@ -1668,7 +1785,9 @@ A tool fires the robot's hardware; don't fire it for pure conversation.
 
 OUTPUT FORMAT — content MUST be valid JSON (no markdown):
 {"speech":"<words>","actions":["<expressive_or_empty>"]}
-Tool calls go in the standard tool_calls field, alongside this content."""
+Tool calls go in the standard tool_calls field, alongside this content.
+
+CRITICAL: "speech" must ALWAYS be a non-empty spoken reply — never "" and never omitted. Even when you call a tool, put a short spoken acknowledgment in "speech" (e.g. {"speech":"好，看我跳舞！","actions":[]}). If you are unsure what to say, say "嗯，我在。" Never return an empty response."""
 
 def _sys_prompt_with_scene(user_text: str = "") -> str:
     scene = _current_scene()
@@ -2373,6 +2492,84 @@ def _clean_speech(speech: str, actions: list) -> tuple[str, list]:
     return speech, (actions or [])
 
 
+# ── Tool-call fallback parser (2026-06-01 端到端鐵證後加) ────────────────────
+# vLLM 啟動帶 `--tool-call-parser hermes`，但 qwen3.6 在 tool_choice=auto 下吐
+# **Qwen 原生 XML**（<tool_call><function=name><parameter=k>v</parameter>），hermes
+# parser 認不得 → OpenAI tool_calls 欄位**永遠空** → 模型的工具意圖只留在 content
+# 純文字裡。沒有這個 fallback，「請跳支舞」「看右邊」只會講話、play_emotion/move_head
+# 從不執行（端到端實證：tool_call_acc EMPTY、actions 常被誤填 greet）。這裡從 raw
+# 文字救回意圖。三種觀察到的格式都認：
+#   1. Qwen XML：  <tool_call><function=play_emotion><parameter=name>dance...
+#   2. 文字 JSON： tool_calls: [{"name":"play_emotion","args"/"arguments":{...}}]
+#   3. 呼叫語法：  play_emotion(name="dance")
+# server 端把 --tool-call-parser 改成對應 Qwen3 的之後，本 fallback 自然變 no-op。
+_KNOWN_TOOL_NAMES = {
+    "play_emotion", "move_head", "stop_motion", "see_what",
+    "find_in_view", "count_items", "query_vision", "recall_memory",
+    "get_current_time",
+}
+
+def _coerce_num(v: str):
+    """'15' → 15, '1.8' → 1.8, 'dance' → 'dance'。"""
+    try:
+        f = float(v)
+        return int(f) if f.is_integer() else f
+    except (TypeError, ValueError):
+        return v
+
+def _fallback_extract_tool_calls(raw: str) -> list[dict]:
+    """從 raw LLM 文字救回 vLLM parser 漏掉的 tool calls。回傳
+    [{"name": str, "arguments": dict}, ...]，找不到回 []。永不 raise。"""
+    if not raw:
+        return []
+    out: list[dict] = []
+    try:
+        # 格式 1 — Qwen XML <function=NAME> ... <parameter=K>V</parameter> ...
+        for fm in re.finditer(r"<function=([a-z_]+)\s*>(.*?)(?:</function>|<tool_call>|\Z)",
+                              raw, re.DOTALL):
+            name = fm.group(1)
+            if name not in _KNOWN_TOOL_NAMES:
+                continue
+            params: dict = {}
+            for pm in re.finditer(r"<parameter=([a-zA-Z_]+)\s*>\s*(.*?)\s*</parameter>",
+                                  fm.group(2), re.DOTALL):
+                params[pm.group(1)] = _coerce_num(pm.group(2).strip())
+            out.append({"name": name, "arguments": params})
+        if out:
+            return out
+        # 格式 2 — 文字 tool_calls: [ {"name":..., "args"/"arguments": {...}} ]
+        for jm in re.finditer(
+                r'\{\s*"name"\s*:\s*"([a-z_]+)"\s*,\s*"(?:args|arguments)"\s*:\s*(\{.*?\})\s*\}',
+                raw, re.DOTALL):
+            name = jm.group(1)
+            if name not in _KNOWN_TOOL_NAMES:
+                continue
+            try:
+                args = json.loads(jm.group(2))
+            except Exception:
+                args = {}
+            out.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+        if out:
+            return out
+        # 格式 3 — 呼叫語法 NAME(k="v", k2=3)
+        for cm in re.finditer(r'\b([a-z_]+)\(([^)]*)\)', raw):
+            name = cm.group(1)
+            if name not in _KNOWN_TOOL_NAMES:
+                continue
+            params = {}
+            for am in re.finditer(
+                    r'([a-zA-Z_]+)\s*=\s*"([^"]*)"|([a-zA-Z_]+)\s*=\s*([-\d.]+)',
+                    cm.group(2)):
+                if am.group(1) is not None:
+                    params[am.group(1)] = am.group(2)
+                else:
+                    params[am.group(3)] = _coerce_num(am.group(4))
+            out.append({"name": name, "arguments": params})
+    except Exception:
+        return out
+    return out
+
+
 def _ask_and_speak_streaming(text: str, mini) -> tuple[str, list]:
     """串流 LLM → sentence chunker → TTS queue → robot speaker。
     回傳 (完整 speech 字串, actions list)；失敗時 raise 讓上層 fallback。"""
@@ -2486,6 +2683,23 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
     # Vision/move-head/etc. live in robot_tools.execute_tool — we need to fire
     # them for the robot to actually move. Without this, model says "turning
     # right" verbally but tool_call gets silently dropped.
+    #
+    # 2026-06-01: vLLM hermes parser misses qwen3.6's Qwen-XML tool calls, so
+    # tool_call_acc is usually EMPTY even when the model clearly intended a tool.
+    # Salvage the intent from the raw text (see _fallback_extract_tool_calls) and
+    # feed it through the SAME execution block by populating tool_call_acc.
+    if not tool_call_acc:
+        _fb_calls = _fallback_extract_tool_calls(full_raw)
+        if _fb_calls:
+            print(f"  [stream tool fallback] 救回 {[c['name'] for c in _fb_calls]} "
+                  f"(vLLM hermes parser 漏掉 Qwen-XML)")
+            for _i, _c in enumerate(_fb_calls):
+                tool_call_acc[_i] = {
+                    "function": {
+                        "name": _c["name"],
+                        "arguments": json.dumps(_c["arguments"], ensure_ascii=False),
+                    },
+                }
     if tool_call_acc:
         try:
             calls_in_order = [tool_call_acc[i] for i in sorted(tool_call_acc.keys())]
@@ -2558,6 +2772,21 @@ def _ask_and_speak_streaming_inner(text: str, mini) -> tuple[str, list]:
         head = full_raw[:500].replace("\n", "\\n")
         print(f"  [LLM stream 0-char debug] raw_head={head!r}")
     speech, actions = _clean_speech(speech, actions)
+    # ── 串流 0 句 fallback（2026-06-02 修「我說一句他不回」）────────────────────
+    # vLLM+Qwen3 在 enable_thinking=False 下結構化輸出不穩（已知 bug，vLLM
+    # #18819/#23404）：模型常把話放在 JSON **外面**或讓 "speech":"" 留空，串流即時
+    # 抽取器（找 "speech":"）抓不到 → n_sent=0 → 整句沒念 → 體感「不理我」。但上面
+    # 的末端解析（JSON parse / _plain_visible fallback）**已經算出 speech**，只是串流
+    # 模式假設「邊串流邊念完了」而從不補念。這裡補：串流 0 句但末端有 speech → 直接念。
+    # 正常路徑（n_sent>0）完全不受影響。len 上限防超長 raw 觸發 30s TTS。
+    # not tool_call_acc：有觸發工具的輪（vision/move 等）由工具分支自己念結果/ack，
+    # 這裡跳過避免重複念。
+    if n_sent == 0 and not tool_call_acc and speech and 1 <= len(speech) <= 300:
+        print(f"  [串流0句 fallback 補念] {speech[:60]!r}", flush=True)
+        try:
+            asyncio.run(_stream_tts(speech, mini))
+        except Exception as _e:
+            print(f"  [串流0句 fallback 念話失敗] {_e}", flush=True)
     return speech, actions
 
 
@@ -2598,6 +2827,83 @@ def _is_meaningful_utterance(text: str) -> bool:
         return any(w not in _NOISE_TOKENS for w in words)
     return True
 
+
+# ── 意圖直通 v2（2026-06-01 完整官方功能映射）─────────────────────────────────
+# 業界正解（Home Assistant 兩層）：明確短指令確定性 fire、長句/對話才丟 LLM。
+# 規則表抽到 robot_intents.py（純資料、可單元測試）。涵蓋：看左右上下（body_yaw
+# 大幅度 ~60° + head）、官方 95 情緒 clip、趣味動作、喚醒/睡覺、點頭搖頭、跳舞、停。
+# 執行在這裡（do_look / play_emotion / do_action / daemon wake-sleep）。
+try:
+    from robot_intents import match_intent as _match_intent
+except Exception as _ie:
+    print(f'  [robot_intents 未載入] {_ie} — 意圖直通停用')
+    def _match_intent(_text):
+        return None
+
+def do_look(mini, body_yaw_rad, head_yaw_deg, head_pitch_deg=0.0, dur=2.0):
+    """大幅度看向某方向：body_yaw（基座馬達、daemon clamp ~±1.05rad≈60°）+ head
+    yaw/pitch 組合，比單純 move_head（只頭 ±25°）明顯。含 pause_tracking 防 face
+    tracker 蓋掉、motion_lock 防併發。永不 raise。"""
+    motion_abort.clear_abort()
+    pause_tracking(dur + GESTURE_TRACK_HOLD_S)
+    if _motion_lock.acquire(blocking=False):
+        try:
+            mini.goto_target(
+                head=create_head_pose(yaw=float(head_yaw_deg), pitch=float(head_pitch_deg)),
+                body_yaw=float(body_yaw_rad), duration=dur, method="minjerk")
+            note_head_command(pitch_deg=float(head_pitch_deg), yaw_deg=float(head_yaw_deg),
+                              body_yaw_rad=float(body_yaw_rad), source="intent_look")
+        except Exception as e:
+            print(f"  [do_look 錯誤] {e}", flush=True)
+        finally:
+            _motion_lock.release()
+
+
+def do_antennas(mini, right_deg, left_deg, wiggle=False, dur=0.5):
+    """天線動作（招牌情緒表達）。right/left 角度（度）。wiggle=True 來回擺動兩次
+    （興奮/開心）再回中。複用 brain 既有 goto_target(antennas=...) 模式（line 721
+    happy 動作同款）。含 pause_tracking + motion_lock。永不 raise。"""
+    motion_abort.clear_abort()
+    total = dur * (3 if wiggle else 1) + 0.5
+    pause_tracking(total + GESTURE_TRACK_HOLD_S)
+    if _motion_lock.acquire(blocking=False):
+        try:
+            r, l = float(right_deg), float(left_deg)
+            mini.goto_target(antennas=np.deg2rad([r, l]), duration=dur, method="cartoon")
+            if wiggle and not motion_abort.interruptible_sleep(dur + 0.1):
+                mini.goto_target(antennas=np.deg2rad([-r, -l]), duration=dur, method="cartoon")
+                if not motion_abort.interruptible_sleep(dur + 0.1):
+                    mini.goto_target(antennas=np.deg2rad([0, 0]), duration=dur, method="minjerk")
+            elif not wiggle and not motion_abort.interruptible_sleep(1.2):
+                mini.goto_target(antennas=np.deg2rad([0, 0]), duration=dur, method="minjerk")
+        except Exception as e:
+            print(f"  [do_antennas 錯誤] {e}", flush=True)
+        finally:
+            _motion_lock.release()
+
+
+def do_look_at(mini, x, y, z, dur=1.5):
+    """看向 3D 空間特定點（SDK look_at_world）。座標(米)：x=前方距離、y=左右
+    (左正)、z=上下(上正)。比 do_look 的固定方位更精準（可看向「左上方」等）。
+    含 pause_tracking + motion_lock。永不 raise。"""
+    motion_abort.clear_abort()
+    pause_tracking(dur + GESTURE_TRACK_HOLD_S)
+    if _motion_lock.acquire(blocking=False):
+        try:
+            mini.look_at_world(float(x), float(y), float(z), duration=dur)
+            # look_at_world 內部走 goto_target、pose 已變；同步 face tracker baseline
+            # 避免下一幀拉回。粗略換算 yaw≈atan2(y,x)、pitch≈-atan2(z,x)（度）。
+            import math as _m
+            yaw_d = _m.degrees(_m.atan2(float(y), float(x)))
+            pitch_d = -_m.degrees(_m.atan2(float(z), float(x)))
+            note_head_command(pitch_deg=pitch_d, yaw_deg=yaw_d, body_yaw_rad=0.0,
+                              source="intent_look_at")
+        except Exception as e:
+            print(f"  [do_look_at 錯誤] {e}", flush=True)
+        finally:
+            _motion_lock.release()
+
+
 # ── 對話一輪 ──────────────────────────────────────────────────────────────────
 def do_conversation(mini):
     set_state(State.CONVERSATION)
@@ -2610,16 +2916,27 @@ def do_conversation(mini):
     # increments once, on natural loop exit.
     session_had_turn = False
     completed_outcome_recorded = False
+    # 連續「沒收到語音」(record 回 None) 的容忍次數。STT 收音弱（單 USB mic、
+    # 一般音量 rms 常掉到 0.003）時，使用者其實有講話、只是沒過門檻。一次 None
+    # 就結束對話 + 重新打招呼 → 體感「不理我」。改成連續 SILENCE_TOL 次才放棄，
+    # 讓小聲使用者多幾次機會。env BRAIN_SILENCE_TOL（預設 3）。
+    _SILENCE_TOL = int(os.getenv("BRAIN_SILENCE_TOL", "3"))
+    silence_count = 0
     while get_state() == State.CONVERSATION and turns < 5:
         obs.pulse("dialog_loop")
         audio = record_utterance(mini)
         if audio is None:
+            silence_count += 1
+            if silence_count < _SILENCE_TOL:
+                # 還沒到容忍上限：安靜地再聽一次，不講話、不結束（避免「不理我」循環）
+                continue
             speak(mini, "沒事，隨時來找我聊聊。")
             try:
                 obs.dialog_outcome.labels(result="no_audio").inc()
             except Exception:
                 pass
             break
+        silence_count = 0   # 有收到音訊就重置
         # Wave4-P3 (#73) Option B: barge-in. We just captured a real
         # user utterance (post-VAD, non-empty). If the previous turn's
         # background do_action thread is still running, signal it to
@@ -2627,15 +2944,23 @@ def do_conversation(mini):
         # nodding / dancing while the new turn's STT+LLM is in flight.
         # The flag is auto-cleared on next do_action entry, so a single
         # set here cannot leak to a future action.
-        try:
-            motion_abort.request_abort("user_voice_detected")
-            logger.info("motion_abort_requested", reason="user_voice_detected")
-        except Exception:
-            pass
-        try:
-            obs.brain_motion_abort_total.labels(reason="user_voice_detected").inc()
-        except Exception:
-            pass
+        #
+        # 2026-06-01: gated OFF by default (VOICE_BARGE_IN=0). With the lowered
+        # SILENCE_THRESHOLD (0.0035) for multi-turn capture, ambient noise was
+        # tripping user_voice_detected and aborting dances / look_around the
+        # instant they began ("動作被自己切掉" — user-reported). Barge-in is a
+        # nice-to-have; finishing the gesture is the priority for elder care.
+        # Set VOICE_BARGE_IN=1 to re-enable interrupting motion on user speech.
+        if env_bool("VOICE_BARGE_IN"):
+            try:
+                motion_abort.request_abort("user_voice_detected")
+                logger.info("motion_abort_requested", reason="user_voice_detected")
+            except Exception:
+                pass
+            try:
+                obs.brain_motion_abort_total.labels(reason="user_voice_detected").inc()
+            except Exception:
+                pass
         t_turn = time.perf_counter()
         text = transcribe(audio)
         if not text:
@@ -2680,6 +3005,44 @@ def do_conversation(mini):
         print(f"  你說：{text}")
         speech, actions = "", []
         streamed = False
+        # ── 第 1 層：意圖直通（明確硬體指令不靠 LLM 取樣運氣）─────────────────
+        _sc = _match_intent(text)
+        if _sc is not None:
+            _k = _sc.get("kind"); _ack = _sc.get("ack")
+            print(f"  [意圖直通:{_k}] {_sc}  ← '{text}'", flush=True)
+            try:
+                if _k == "look":
+                    do_look(mini, _sc.get("body_yaw", 0.0), _sc.get("yaw", 0.0), _sc.get("pitch", 0.0))
+                elif _k == "look_at":
+                    do_look_at(mini, _sc.get("x", 0.5), _sc.get("y", 0.0), _sc.get("z", 0.0))
+                elif _k == "antenna":
+                    do_antennas(mini, _sc.get("right", 60.0), _sc.get("left", 60.0),
+                                wiggle=_sc.get("wiggle", False))
+                elif _k == "emotion":
+                    _instrumented_exec_tool("play_emotion", {"name": _sc["clip"]})
+                elif _k == "dance":
+                    _instrumented_exec_tool("play_emotion", {"name": _sc.get("name", "dance")})
+                elif _k == "action":
+                    do_action(mini, _sc["name"])
+                elif _k == "wake":
+                    from robot_tools import _post_daemon as _pd
+                    _pd("/api/move/play/wake_up"); pause_tracking(5.0)
+                elif _k == "sleep":
+                    from robot_tools import _post_daemon as _pd
+                    _pd("/api/move/play/goto_sleep"); pause_tracking(5.0)
+                elif _k == "stop":
+                    _instrumented_exec_tool("stop_motion", {})
+            except Exception as _e:
+                print(f"  [意圖直通錯誤] {_k}: {_e}", flush=True)
+            if _ack:
+                speak(mini, _ack)
+            _log_turn(text, _ack or f"[{_k}]")
+            turns += 1
+            try:
+                obs.dialog_outcome.labels(result="turn_completed").inc()
+            except Exception:
+                pass
+            continue   # 指令已執行，本輪結束，回去聽下一句
         if LLM_STREAMING:
             try:
                 speech, actions = _ask_and_speak_streaming(text, mini)
@@ -2796,6 +3159,13 @@ def tracking_loop(mini, stop_event: threading.Event):
     NO_FRAME_LIMIT_S = float(os.getenv("BRAIN_NO_FRAME_LIMIT_S", "20"))
     _last_good_frame_t = time.time()
 
+    # 沒偵測到人臉時的行為（user 2026-06-01：要「當場定住、完全不動」）。
+    # 兩者預設 OFF = freeze-in-place；設為 1 可恢復舊的自主動作行為。
+    #   IDLE_WANDER=1        → IDLE 時每 30s 主動 look_around 掃描
+    #   FACE_LOST_RECENTER=1 → 臉消失後把頭平滑轉回正中
+    _IDLE_WANDER = os.getenv("IDLE_WANDER", "0") == "1"
+    _FACE_LOST_RECENTER = os.getenv("FACE_LOST_RECENTER", "0") == "1"
+
     # Sync face_tracker baseline from daemon's real pose at startup. Without
     # this, _last_cmd_pitch/yaw are 0.0 by default while the daemon's actual
     # pose may be anywhere (e.g. user just moved head via /api/move/goto,
@@ -2900,7 +3270,11 @@ def tracking_loop(mini, stop_event: threading.Event):
             # set_target when motors are disabled keeps daemon's stored
             # target at whatever was last commanded by an explicit goto
             # (which is always a smooth, safe pose like neutral or wake_up).
-            if _get_motor_state() != "enabled":
+            if _tracking_paused():
+                # 明確手勢進行中（move_head / do_action / emotion）— 不要送
+                # set_target 跟它搶 yaw/pitch/body，否則看左右會被立刻轉回置中。
+                lock_ok = False
+            elif _get_motor_state() != "enabled":
                 lock_ok = False  # skip set_target entirely below
             else:
                 lock_ok = _motion_lock.acquire(blocking=False)
@@ -3019,11 +3393,13 @@ def tracking_loop(mini, stop_event: threading.Event):
                     face_lost_count = 0
                     smooth_dx, smooth_dy = 0.0, 0.0  # 重置平滑值
                     set_state(State.IDLE)
-                    # 臉沒了就把頭轉回中間，不要卡在偏向的位置
-                    # ⚠️ 必用 goto_target + duration：tracking loop 用 set_target 是即時
-                    # streaming setpoint、底層 50Hz 平滑；但這裡是離散一次性 reset、若
-                    # 用 set_target(0,0) 從 ±25° 位置會瞬間衝回中、嚇人。改用 goto_target。
-                    if _motion_lock.acquire(blocking=False):
+                    # 臉沒了：預設「當場定住、完全不動」（user 2026-06-01）。
+                    # 不自動回正面 → 頭停在最後追蹤的位置、不再有自主馬達動作。
+                    # 設 FACE_LOST_RECENTER=1 可恢復舊的「平滑轉回中間」行為：
+                    # ⚠️ 該行為必用 goto_target + duration：tracking loop 的 set_target
+                    # 是即時 streaming setpoint、底層 50Hz 平滑；但回正是離散一次性 reset、
+                    # 若用 set_target(0,0) 從 ±25° 位置會瞬間衝回中、嚇人。故用 goto_target。
+                    if _FACE_LOST_RECENTER and _motion_lock.acquire(blocking=False):
                         try:
                             try:
                                 from motor_log import log_motor
@@ -3046,8 +3422,9 @@ def tracking_loop(mini, stop_event: threading.Event):
                         finally:
                             _motion_lock.release()
 
-        # IDLE 時偶爾四處張望，少講話
-        if get_state() == State.IDLE and time.time() - idle_wander_t > 30:
+        # IDLE（沒偵測到人臉）時：預設「定住不動」，不主動四處張望。
+        # 設 IDLE_WANDER=1 可恢復舊的每 30s look_around 掃描行為。
+        if _IDLE_WANDER and get_state() == State.IDLE and time.time() - idle_wander_t > 30:
             idle_wander_t = time.time()
             idle_lines = [None] * 8 + ["嗯。", "..."]   # 80% 純動作不講話
             line = random.choice(idle_lines)

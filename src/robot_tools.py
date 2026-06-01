@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json as _json
+import math as _math
 import os as _os
 import re as _re
 import threading as _threading
@@ -285,8 +286,18 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
         d = max(MIN_DUR, float(duration) if duration is not None else MIN_DUR)
     except (TypeError, ValueError):
         d = MIN_DUR
+    # UNIT FIX (2026-06-01): daemon /api/move/goto XYZRPYPose expects
+    # roll/pitch/yaw in RADIANS — OpenAPI schema says "angles in radians", and
+    # this was verified live (yaw=0.35 rad turns head ~20°; yaw=15 raw → +134°
+    # runaway, out of the Stewart platform's working range → head wouldn't move
+    # = the user's "look right does nothing"). The whole LLM-facing API + the
+    # ±25° clamp above are in DEGREES, so convert ONLY here at the REST boundary.
+    # note_head_command below stays in degrees (face-tracker baseline is degrees).
     body = {
-        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0, "roll": r, "pitch": p, "yaw": y},
+        "head_pose": {"x": 0.0, "y": 0.0, "z": 0.0,
+                      "roll": _math.radians(r),
+                      "pitch": _math.radians(p),
+                      "yaw": _math.radians(y)},
         "antennas": None,
         "body_yaw": None,
         "duration": d,
@@ -310,6 +321,10 @@ def _tool_move_head(pitch: float = 0.0, yaw: float = 0.0, roll: float = 0.0,
             import robot_brain as _rb
             _rb.note_head_command(pitch_deg=p, yaw_deg=y, body_yaw_rad=None,
                                   source="tool_move_head")
+            # 抑制 face tracker：手勢執行(d) + hold 期間不讓追蹤把頭轉回置中。
+            # 這是「看左右(yaw)沒反應」的永久修——yaw 軸人臉留在畫面內、tracker
+            # 會在 ~50ms 內轉回置中抵銷 move_head。pitch/roll 較少被搶所以偶爾成功。
+            _rb.pause_tracking(d + getattr(_rb, "GESTURE_TRACK_HOLD_S", 2.0))
         except Exception:
             pass
         result["clipped"] = clipped
@@ -349,6 +364,14 @@ def _schedule_face_baseline_resync(delay_s: float = 5.0, source: str = "post_cli
     most pollen-robotics clips return to neutral, so this is a reasonable
     last-resort default.
     """
+    # 2026-06-01: 暫停 face tracker 直到 clip 大致播完 + hold。否則 tracker 會在
+    # clip 還在播時每幀送 set_target 搶馬達、把舞蹈/情緒動作蓋掉（同「看左右被
+    # 蓋掉」根因）。這裡一處涵蓋全部 emotion/dance 播放路徑（都會呼叫本函式）。
+    try:
+        import robot_brain as _rb
+        _rb.pause_tracking(delay_s + getattr(_rb, "GESTURE_TRACK_HOLD_S", 2.0))
+    except Exception:
+        pass
     global _resync_timer, _resync_gen
     with _resync_timer_lock:
         # Cancel any pending resync — last clip wins, no overlapping writes.
